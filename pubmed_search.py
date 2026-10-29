@@ -69,7 +69,7 @@ def build_search_query(
     return query
 
 
-def search_pubmed(query: str, max_results: int = 200, email: str = "minekoya0@gmail.com") -> list[str]:
+def search_pubmed(query: str, max_results: int = 9999, email: str = "minekoya0@gmail.com") -> list[str]:
     """
     PubMed APIでPMIDのリストを取得する
 
