@@ -4,6 +4,7 @@
 """
 
 import re
+import os
 
 
 # ===== 除外基準キーワード =====
