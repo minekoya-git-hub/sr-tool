@@ -11,33 +11,57 @@ import tempfile
 import json
 import base64
 import requests as _requests
+import pickle
+import pathlib
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 
-# ─── セッション永続化（localStorage） ───
-_PERSIST_KEYS = ["pico", "pubmed_done", "n_pubmed", "n_import", "n_removed_dup",
-                 "ai_screening_done", "query"]
+# ─── セッション永続化（サーバー側ファイル） ───
+# Streamlit Cloud でも /tmp は書き込み可能。セッションIDをクエリパラメータで持ち回す。
+_SESSION_DIR = pathlib.Path(tempfile.gettempdir()) / "sr_sessions"
+_SESSION_DIR.mkdir(exist_ok=True)
 
-_SAVE_JS = """
-<script>
-function srSave(key, val) {
-    try { localStorage.setItem('sr_' + key, JSON.stringify(val)); } catch(e) {}
-}
-function srLoad(key) {
-    try { return JSON.parse(localStorage.getItem('sr_' + key)); } catch(e) { return null; }
-}
-</script>
-"""
+def _session_path(sid: str) -> pathlib.Path:
+    return _SESSION_DIR / f"{sid}.pkl"
 
-def _df_to_b64(df):
-    if df is None: return None
-    return base64.b64encode(df.to_csv(index=False).encode()).decode()
+def _save_session(sid: str, state: dict):
+    """session_state の保存可能なキーをpickleで保存"""
+    saveable = {}
+    skip = {"_is_running", "FormSubmitter"}
+    for k, v in state.items():
+        if k.startswith("_") or k in skip:
+            continue
+        try:
+            pickle.dumps(v)   # シリアライズ可能かテスト
+            saveable[k] = v
+        except Exception:
+            pass
+    try:
+        with open(_session_path(sid), "wb") as f:
+            pickle.dump(saveable, f)
+    except Exception:
+        pass
 
-def _b64_to_df(s):
-    if not s: return None
-    import io
-    return pd.read_csv(io.StringIO(base64.b64decode(s).decode()))
+def _load_session(sid: str) -> dict:
+    p = _session_path(sid)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return {}
+
+def _get_or_create_sid() -> str:
+    """URLクエリパラメータ sid= からセッションIDを取得、なければ新規作成"""
+    import uuid
+    params = st.query_params
+    sid = params.get("sid", "")
+    if not sid:
+        sid = uuid.uuid4().hex
+        st.query_params["sid"] = sid
+    return sid
 
 
 # ─── Unpaywall で無料PDF URLを取得 ───
@@ -84,14 +108,15 @@ h2 { font-size: 1.2rem !important; border-bottom: 2px solid #1a73e8; padding-bot
 </style>
 """, unsafe_allow_html=True)
 
-# ─── セッション状態の初期化 ───
+# ─── セッション状態の初期化（ファイルから復元） ───
 _defaults = {
     "step": 1,
-    "articles_df": None,      # 全文献 DataFrame（PubMed + インポート統合後）
+    "articles_df": None,
     "pico": {},
     "query": "",
     "pubmed_done": False,
-    "import_articles": [],    # RIS/XML からインポートした Article リスト
+    "pubmed_articles": [],
+    "import_articles": [],
     "n_pubmed": 0,
     "n_import": 0,
     "n_removed_dup": 0,
@@ -106,10 +131,30 @@ _defaults = {
     "sa_exclusions": {},
     "sa_result": None,
     "sa_included": [],
+    "_sid": "",
+    "_loaded": False,
 }
-for k, v in _defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+
+# セッションID取得
+_sid = _get_or_create_sid()
+
+# 初回ロード時だけファイルから復元
+if not st.session_state.get("_loaded"):
+    saved = _load_session(_sid)
+    for k, v in _defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = saved.get(k, v)
+    st.session_state["_sid"] = _sid
+    st.session_state["_loaded"] = True
+else:
+    # 既にロード済み → デフォルトだけ補完
+    for k, v in _defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+def _autosave():
+    """重要な操作のたびに呼ぶ"""
+    _save_session(st.session_state["_sid"], dict(st.session_state))
 
 # ─── タイトル ───
 st.markdown("## 🏃 スポーツ傷害リスク因子 SR自動化ツール")
@@ -253,6 +298,7 @@ with tabs[0]:
                     st.session_state.pubmed_articles = import_arts
                     st.session_state.n_pubmed = len(import_arts)
                     st.session_state.pubmed_done = True
+                    _autosave()
                     st.success(f"✅ PubMed: **{len(import_arts)}件** 取得完了")
                 except Exception as e:
                     st.error(f"PubMed検索エラー: {e}")
@@ -289,6 +335,7 @@ with tabs[0]:
 
             st.session_state.import_articles = imported
             st.session_state.n_import = len(imported)
+            _autosave()
             st.success(f"✅ インポート完了: **{len(imported)}件**")
 
         if st.session_state.n_import > 0:
@@ -321,6 +368,7 @@ with tabs[0]:
         }
         st.success(f"✅ 重複除去: {n_removed}件 → 残り **{len(unique_arts)}件** → スクリーニングタブへ")
         st.session_state.step = 2
+        _autosave()
         st.rerun()
 
     if st.session_state.articles_df is not None:
@@ -383,6 +431,7 @@ with tabs[1]:
                             if dec == "除外":
                                 st.session_state.articles_df.at[idx, "除外理由"] = res["reason"]
                     st.session_state.ai_screening_done = True
+                _autosave()
                 st.rerun()
         else:
             ai_col1, ai_col2 = st.columns([3, 1])
@@ -444,15 +493,18 @@ with tabs[1]:
                 if bc1.button("✅ 採択", key=f"pr_inc_{idx}"):
                     st.session_state.articles_df.at[idx, "一次スクリーニング"] = "採択"
                     st.session_state.articles_df.at[idx, "除外理由"] = ""
+                    _autosave()
                     st.rerun()
                 if bc2.button("❌ 除外", key=f"pr_exc_{idx}"):
                     st.session_state.articles_df.at[idx, "一次スクリーニング"] = "除外"
                     st.session_state.articles_df.at[idx, "除外理由"] = reason
+                    _autosave()
                     st.rerun()
                 if bc3.button("↩️ AI判定に戻す", key=f"pr_rst_{idx}"):
                     orig = ai_d if ai_d in ("採択","除外") else "採択"
                     st.session_state.articles_df.at[idx, "一次スクリーニング"] = orig
                     st.session_state.articles_df.at[idx, "除外理由"] = ai_r if orig=="除外" else ""
+                    _autosave()
                     st.rerun()
 
         # CSV エクスポート
@@ -462,6 +514,8 @@ with tabs[1]:
 
     # ── 二次スクリーニング ──
     with sub2:
+        from ai_screening import batch_ft_screen
+
         st.header("二次スクリーニング（フルテキスト）")
         df_ft_base = st.session_state.articles_df
         ft_df = df_ft_base[df_ft_base["一次スクリーニング"] == "採択"].copy()
@@ -470,140 +524,222 @@ with tabs[1]:
             st.info("一次スクリーニングで採択された文献がありません。")
             st.stop()
 
-        if "FTステータス" not in st.session_state.articles_df.columns:
-            st.session_state.articles_df["FTステータス"] = ""
-            st.session_state.articles_df["PDFパス"] = ""
+        # 列初期化
+        for col, default in [("FTステータス",""), ("PDFパス",""),
+                              ("FT判定",""), ("FT判定理由",""), ("FTスコア","")]:
+            if col not in st.session_state.articles_df.columns:
+                st.session_state.articles_df[col] = default
 
-        ft_total = len(ft_df)
-        ft_ready = (st.session_state.articles_df.loc[ft_df.index, "FTステータス"] == "PDF済み").sum()
-        ft_na    = (st.session_state.articles_df.loc[ft_df.index, "FTステータス"] == "入手不可").sum()
-        ft_pend  = ft_total - ft_ready - ft_na
+        ft_total  = len(ft_df)
+        ft_ready  = (st.session_state.articles_df.loc[ft_df.index, "FTステータス"] == "PDF済み").sum()
+        ft_na     = (st.session_state.articles_df.loc[ft_df.index, "FTステータス"] == "入手不可").sum()
+        ft_pend   = ft_total - ft_ready - ft_na
+        ft_inc    = (st.session_state.articles_df.loc[ft_df.index, "FT判定"] == "採択").sum()
+        ft_exc    = (st.session_state.articles_df.loc[ft_df.index, "FT判定"] == "除外").sum()
+        ft_judged = (st.session_state.articles_df.loc[ft_df.index, "FT判定"] != "").sum()
 
-        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
         mc1.metric("FT対象", ft_total)
-        mc2.metric("⏳ 保留中", ft_pend)
-        mc3.metric("✅ PDF済み", ft_ready)
-        mc4.metric("❌ 入手不可", ft_na)
+        mc2.metric("📄 本文取得済み", ft_ready)
+        mc3.metric("❌ 入手不可", ft_na)
+        mc4.metric("✅ FT採択", ft_inc)
+        mc5.metric("🚫 FT除外", ft_exc)
 
         st.divider()
 
-        ft_filter = st.selectbox("表示フィルター", ["全件", "保留中のみ", "PDF済み", "入手不可"])
+        # ── STEP 1: 本文PDF取得 ──
+        st.subheader("STEP 1：本文PDFの取得")
+        st.caption("オープンアクセス論文は自動取得。それ以外は手動でアップロード、または「入手不可」にしてください。")
+
+        email_ft = st.session_state.get("pico", {}).get("email", "minekoya0@gmail.com")
+
+        col_auto, col_info = st.columns([2, 3])
+        with col_auto:
+            if st.button("🌐 オープンアクセスPDFを一括自動取得", type="primary"):
+                prog = st.progress(0)
+                status_ph = st.empty()
+                n_ok = 0
+                targets_idx = [
+                    i for i in ft_df.index
+                    if st.session_state.articles_df.at[i, "FTステータス"] == ""
+                ]
+                total_t = len(targets_idx)
+                for i, idx2 in enumerate(targets_idx):
+                    row2 = st.session_state.articles_df.loc[idx2]
+                    doi2 = str(row2.get("DOI",""))
+                    status_ph.info(f"🔍 [{i+1}/{total_t}] {str(row2['タイトル'])[:50]}... を検索中")
+                    pdf_url = _get_free_pdf_url(doi2, email_ft)
+                    if pdf_url:
+                        try:
+                            status_ph.info(f"⬇️ ダウンロード中: {str(row2['タイトル'])[:50]}...")
+                            resp = _requests.get(pdf_url, timeout=30,
+                                                 headers={"User-Agent":"Mozilla/5.0"})
+                            if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
+                                tmp_dir = tempfile.mkdtemp()
+                                sp = os.path.join(tmp_dir, f"{row2['PMID']}.pdf")
+                                with open(sp, "wb") as f:
+                                    f.write(resp.content)
+                                st.session_state.articles_df.at[idx2, "FTステータス"] = "PDF済み"
+                                st.session_state.articles_df.at[idx2, "PDFパス"] = sp
+                                n_ok += 1
+                        except Exception:
+                            pass
+                    prog.progress((i+1)/max(total_t,1))
+                status_ph.empty()
+                prog.empty()
+                _autosave()
+                st.success(f"✅ 自動取得: {n_ok}/{total_t}件 取得（残りは手動アップロード or 入手不可）")
+                st.rerun()
+        with col_info:
+            st.info(f"📄 本文取得済み: {ft_ready}件 ／ ❌ 入手不可: {ft_na}件 ／ ⏳ 未処理: {ft_pend}件")
+
+        st.divider()
+
+        # ── STEP 2: AI二次スクリーニング ──
+        st.subheader("STEP 2：AI二次スクリーニング（フルテキスト判定）")
+        st.caption("PDFがある場合はその内容で、ない場合は抄録で自動判定します。")
+
+        pico = st.session_state.get("pico", {})
+
+        if ft_judged == 0 or ft_judged < ft_total:
+            btn_label = "🤖 AI二次スクリーニングを実行" if ft_judged == 0 else f"🔄 未判定 {ft_total - ft_judged} 件を追加判定"
+            if st.button(btn_label, type="primary"):
+                # 未判定のもののみ対象
+                pending_ft = ft_df[
+                    st.session_state.articles_df.loc[ft_df.index, "FT判定"] == ""
+                ]
+                with st.spinner(f"AIが {len(pending_ft)} 件を判定中..."):
+                    results = batch_ft_screen(
+                        pending_ft,
+                        sport=pico.get("sport",""),
+                        injury=pico.get("injury",""),
+                        population=pico.get("population",""),
+                        extraction_results=st.session_state.get("extraction_results", {}),
+                    )
+                    for res in results:
+                        pmid = res["pmid"]
+                        mask = st.session_state.articles_df["PMID"].astype(str) == pmid
+                        for midx in st.session_state.articles_df[mask].index:
+                            dec = res["decision"]
+                            mapped = "採択" if dec in ("採択", "要確認") else "除外"
+                            st.session_state.articles_df.at[midx, "FT判定"] = mapped
+                            st.session_state.articles_df.at[midx, "FT判定理由"] = res["reason"]
+                            st.session_state.articles_df.at[midx, "FTスコア"] = res["score"]
+                            # 入手不可文献は自動的に除外
+                            if st.session_state.articles_df.at[midx, "FTステータス"] == "入手不可":
+                                st.session_state.articles_df.at[midx, "FT判定"] = "除外"
+                                st.session_state.articles_df.at[midx, "除外理由"] = "Full text not available"
+                _autosave()
+                st.rerun()
+        else:
+            c1, c2 = st.columns([3, 1])
+            c1.success(f"✅ AI二次判定完了 — 採択:{ft_inc}件 / 除外:{ft_exc}件")
+            if c2.button("🔄 全件再実行"):
+                st.session_state.articles_df.loc[ft_df.index, "FT判定"] = ""
+                st.session_state.articles_df.loc[ft_df.index, "FT判定理由"] = ""
+                _autosave()
+                st.rerun()
+
+        st.divider()
+
+        # ── 結果一覧 ──
+        st.subheader("判定結果の確認・手動修正")
+        ft_filter = st.selectbox("表示フィルター",
+            ["全件", "FT採択", "FT除外", "要確認", "本文PDF取得済み", "入手不可・未取得"])
         disp_ft = ft_df.copy()
-        if ft_filter == "保留中のみ":
-            disp_ft = disp_ft[st.session_state.articles_df.loc[ft_df.index, "FTステータス"] == ""]
-        elif ft_filter == "PDF済み":
-            disp_ft = disp_ft[st.session_state.articles_df.loc[ft_df.index, "FTステータス"] == "PDF済み"]
-        elif ft_filter == "入手不可":
-            disp_ft = disp_ft[st.session_state.articles_df.loc[ft_df.index, "FTステータス"] == "入手不可"]
+        cur_ft_status  = st.session_state.articles_df.loc[ft_df.index, "FTステータス"]
+        cur_ft_decision = st.session_state.articles_df.loc[ft_df.index, "FT判定"]
+        if ft_filter == "FT採択":
+            disp_ft = disp_ft[cur_ft_decision == "採択"]
+        elif ft_filter == "FT除外":
+            disp_ft = disp_ft[cur_ft_decision == "除外"]
+        elif ft_filter == "要確認":
+            disp_ft = disp_ft[cur_ft_decision == "要確認"]
+        elif ft_filter == "本文PDF取得済み":
+            disp_ft = disp_ft[cur_ft_status == "PDF済み"]
+        elif ft_filter == "入手不可・未取得":
+            disp_ft = disp_ft[cur_ft_status != "PDF済み"]
 
         st.write(f"{len(disp_ft)}件を表示中")
 
-        # ── 一括自動取得ボタン ──
-        email_ft = st.session_state.get("pico", {}).get("email", "minekoya0@gmail.com")
-        if st.button("🌐 オープンアクセスPDFを一括自動取得", type="primary"):
-            prog = st.progress(0)
-            status_ph = st.empty()
-            n_ok = 0
-            targets = disp_ft[st.session_state.articles_df.loc[disp_ft.index,"FTステータス"]==""]
-            total_t = len(targets)
-            for i, (idx2, row2) in enumerate(targets.iterrows()):
-                doi2 = row2.get("DOI","")
-                status_ph.info(f"🔍 [{i+1}/{total_t}] {row2['タイトル'][:50]}... を検索中")
-                pdf_url = _get_free_pdf_url(doi2, email_ft)
-                if pdf_url:
-                    try:
-                        status_ph.info(f"⬇️ PDFをダウンロード中: {row2['タイトル'][:50]}...")
-                        resp = _requests.get(pdf_url, timeout=30,
-                                             headers={"User-Agent":"Mozilla/5.0"})
-                        if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
-                            tmp_dir = tempfile.mkdtemp()
-                            sp = os.path.join(tmp_dir, f"{row2['PMID']}.pdf")
-                            with open(sp, "wb") as f:
-                                f.write(resp.content)
-                            st.session_state.articles_df.at[idx2, "FTステータス"] = "PDF済み"
-                            st.session_state.articles_df.at[idx2, "PDFパス"] = sp
-                            n_ok += 1
-                    except Exception:
-                        pass
-                prog.progress((i+1)/max(total_t,1))
-            status_ph.empty()
-            prog.empty()
-            st.success(f"✅ 自動取得完了: {n_ok}/{total_t}件 取得できました（残りは手動でアップロードしてください）")
-            st.rerun()
-
-        st.divider()
-
         for idx, row in disp_ft.iterrows():
-            ft_status = st.session_state.articles_df.at[idx, "FTステータス"]
-            st_icon = {"PDF済み":"✅","入手不可":"❌"}.get(ft_status, "⏳")
+            ft_status   = st.session_state.articles_df.at[idx, "FTステータス"]
+            ft_dec      = st.session_state.articles_df.at[idx, "FT判定"]
+            ft_reason   = st.session_state.articles_df.at[idx, "FT判定理由"]
+            ft_score    = st.session_state.articles_df.at[idx, "FTスコア"]
 
-            with st.expander(f"{st_icon} [{row['年']}] {row['タイトル'][:80]}"):
+            dec_icon = {"採択":"✅","除外":"🚫","要確認":"⚠️"}.get(ft_dec, "⬜")
+            pdf_icon = "📄" if ft_status == "PDF済み" else ("🔒" if ft_status == "入手不可" else "📭")
+            score_str = f" [{ft_score}]" if ft_score != "" else ""
+
+            with st.expander(f"{dec_icon}{pdf_icon} [{row['年']}] {row['タイトル'][:75]}{score_str}"):
                 st.write(f"**著者:** {row['著者']}  |  **PMID:** {row['PMID']}")
-                if row.get('DOI'):
+                if row.get("DOI"):
                     doi_url = f"https://doi.org/{row['DOI']}"
                     st.markdown(f"**DOI:** [{doi_url}]({doi_url})")
 
-                if ft_status == "PDF済み":
-                    pdf_path = st.session_state.articles_df.at[idx, "PDFパス"]
-                    col_ok, col_rst = st.columns([3, 1])
-                    col_ok.success("✅ PDF取得済み")
-                    if col_rst.button("↩️ リセット", key=f"ft_rst_{idx}"):
-                        st.session_state.articles_df.at[idx, "FTステータス"] = ""
-                        st.session_state.articles_df.at[idx, "PDFパス"] = ""
-                        st.rerun()
+                # AI判定結果表示
+                if ft_dec:
+                    color = {"採択":"success","除外":"error","要確認":"warning"}.get(ft_dec,"info")
+                    getattr(st, color)(f"🤖 AI判定: **{ft_dec}**  |  理由: {ft_reason}")
 
-                    # ── PDF インラインビューア ──
-                    if pdf_path and os.path.exists(pdf_path):
-                        # ダウンロードボタン
+                # 手動上書きボタン
+                bc1, bc2, bc3 = st.columns(3)
+                if bc1.button("✅ 採択（確定）", key=f"ft_inc_{idx}"):
+                    st.session_state.articles_df.at[idx, "FT判定"] = "採択"
+                    st.session_state.articles_df.at[idx, "除外理由"] = ""
+                    _autosave(); st.rerun()
+                if bc2.button("🚫 除外", key=f"ft_exc_{idx}"):
+                    st.session_state.articles_df.at[idx, "FT判定"] = "除外"
+                    _autosave(); st.rerun()
+                if bc3.button("❌ 入手不可", key=f"ft_na_{idx}"):
+                    st.session_state.articles_df.at[idx, "FTステータス"] = "入手不可"
+                    st.session_state.articles_df.at[idx, "FT判定"] = "除外"
+                    st.session_state.articles_df.at[idx, "除外理由"] = "Full text not available"
+                    _autosave(); st.rerun()
+
+                # PDF アップロード（未取得の場合）
+                if ft_status != "PDF済み":
+                    with st.expander("📎 PDFを手動でアップロード"):
+                        uploaded_pdf = st.file_uploader(
+                            "PDFをアップロード", type=["pdf"], key=f"pdf_up_{idx}"
+                        )
+                        if uploaded_pdf is not None:
+                            with st.spinner(f"⏳ {uploaded_pdf.name} をアップロード中..."):
+                                tmp_dir = tempfile.mkdtemp()
+                                save_path = os.path.join(tmp_dir, f"{row['PMID']}.pdf")
+                                with open(save_path, "wb") as f:
+                                    f.write(uploaded_pdf.read())
+                                st.session_state.articles_df.at[idx, "FTステータス"] = "PDF済み"
+                                st.session_state.articles_df.at[idx, "PDFパス"] = save_path
+                                st.session_state.articles_df.at[idx, "FT判定"] = ""  # 再判定促す
+                            _autosave()
+                            st.success(f"✅ アップロード完了。AI判定を再実行してください。")
+                            st.rerun()
+
+                # PDF インラインビューア（取得済みの場合）
+                if ft_status == "PDF済み":
+                    st.success("✅ 本文PDF取得済み")
+                    pdf_path = st.session_state.articles_df.at[idx, "PDFパス"]
+                    if pdf_path and os.path.exists(str(pdf_path)):
                         with open(pdf_path, "rb") as f:
                             pdf_bytes = f.read()
-                        st.download_button(
-                            "⬇️ PDFをダウンロード",
-                            data=pdf_bytes,
-                            file_name=f"{row['PMID']}.pdf",
-                            mime="application/pdf",
-                            key=f"dl_{idx}",
-                        )
-                        # Base64 埋め込みビューア
+                        st.download_button("⬇️ PDFをダウンロード", data=pdf_bytes,
+                            file_name=f"{row['PMID']}.pdf", mime="application/pdf",
+                            key=f"dl_{idx}")
                         b64 = base64.b64encode(pdf_bytes).decode()
-                        pdf_display = f"""
-                        <iframe
-                            src="data:application/pdf;base64,{b64}#toolbar=1&navpanes=0&scrollbar=1"
-                            width="100%"
-                            height="700px"
-                            style="border:1px solid #ccc; border-radius:6px;"
-                            type="application/pdf">
-                        </iframe>
-                        """
-                        st.markdown(pdf_display, unsafe_allow_html=True)
+                        st.markdown(
+                            f'<iframe src="data:application/pdf;base64,{b64}'
+                            f'#toolbar=1&navpanes=0" width="100%" height="680px" '
+                            f'style="border:1px solid #ccc;border-radius:6px;" '
+                            f'type="application/pdf"></iframe>',
+                            unsafe_allow_html=True)
                     else:
-                        st.warning("⚠️ PDFファイルが見つかりません（セッションがリセットされた可能性があります）")
-                elif ft_status == "入手不可":
-                    st.error("❌ 入手不可（除外）")
-                    if st.button("↩️ リセット", key=f"ft_rst2_{idx}"):
-                        st.session_state.articles_df.at[idx, "FTステータス"] = ""
-                        st.rerun()
-                else:
-                    # 手動アップロード
-                    st.info("📎 PDFを手動でアップロードしてください")
-                    uploaded_pdf = st.file_uploader(
-                        "PDFをアップロード", type=["pdf"], key=f"pdf_up_{idx}"
-                    )
-                    if uploaded_pdf is not None:
-                        with st.spinner(f"⏳ {uploaded_pdf.name} をアップロード中... しばらくお待ちください"):
-                            tmp_dir = tempfile.mkdtemp()
-                            save_path = os.path.join(tmp_dir, f"{row['PMID']}.pdf")
-                            with open(save_path, "wb") as f:
-                                f.write(uploaded_pdf.read())
-                            st.session_state.articles_df.at[idx, "FTステータス"] = "PDF済み"
-                            st.session_state.articles_df.at[idx, "PDFパス"] = save_path
-                        st.success(f"✅ アップロード完了: {uploaded_pdf.name}")
-                        st.rerun()
-
-                    if st.button("❌ 入手不可（除外）", key=f"ft_na_{idx}"):
-                        st.session_state.articles_df.at[idx, "FTステータス"] = "入手不可"
-                        st.session_state.articles_df.at[idx, "除外理由"] = "Full text not available"
-                        st.rerun()
+                        if st.button("↩️ PDFをリセット", key=f"ft_rst_{idx}"):
+                            st.session_state.articles_df.at[idx, "FTステータス"] = ""
+                            st.session_state.articles_df.at[idx, "PDFパス"] = ""
+                            _autosave(); st.rerun()
+                        st.warning("⚠️ PDFが見つかりません（サーバー再起動でファイルが消えた可能性）")
 
 
 # ════════════════════════════════════════════════════
