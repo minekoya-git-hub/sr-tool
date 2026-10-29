@@ -654,6 +654,9 @@ with tabs[3]:
 
     auto_method, auto_var, auto_reason = auto_select_method(studies)
     st.info(f"**自動選択** — 手法: {auto_method}  分散: {auto_var}  理由: {auto_reason}")
+    method_code = auto_method
+    var_code = auto_var
+    force_fixed = False
     with st.expander("🔧 手法を手動で変更"):
         mc1, mc2, mc3 = st.columns(3)
         manual_method = mc1.selectbox("統合手法", ["MH（Mantel-Haenszel）","IV（Inverse Variance）","Peto"],
@@ -663,10 +666,6 @@ with tabs[3]:
         force_fixed = mc3.checkbox("固定効果モデルを強制")
         method_code = manual_method.split("（")[0].strip()
         var_code = manual_var.split("（")[0].strip()
-    else:
-        method_code = auto_method
-        var_code = auto_var
-        force_fixed = False
 
     if st.button("▶ メタアナリシスを実行", type="primary"):
         try:
