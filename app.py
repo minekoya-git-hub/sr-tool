@@ -8,8 +8,52 @@ import pandas as pd
 import os
 import sys
 import tempfile
+import json
+import base64
+import requests as _requests
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+
+# ─── セッション永続化（localStorage） ───
+_PERSIST_KEYS = ["pico", "pubmed_done", "n_pubmed", "n_import", "n_removed_dup",
+                 "ai_screening_done", "query"]
+
+_SAVE_JS = """
+<script>
+function srSave(key, val) {
+    try { localStorage.setItem('sr_' + key, JSON.stringify(val)); } catch(e) {}
+}
+function srLoad(key) {
+    try { return JSON.parse(localStorage.getItem('sr_' + key)); } catch(e) { return null; }
+}
+</script>
+"""
+
+def _df_to_b64(df):
+    if df is None: return None
+    return base64.b64encode(df.to_csv(index=False).encode()).decode()
+
+def _b64_to_df(s):
+    if not s: return None
+    import io
+    return pd.read_csv(io.StringIO(base64.b64decode(s).decode()))
+
+
+# ─── Unpaywall で無料PDF URLを取得 ───
+def _get_free_pdf_url(doi: str, email: str = "minekoya0@gmail.com") -> str | None:
+    if not doi:
+        return None
+    try:
+        r = _requests.get(f"https://api.unpaywall.org/v2/{doi}",
+                          params={"email": email}, timeout=8)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        best = data.get("best_oa_location") or {}
+        return best.get("url_for_pdf") or best.get("url")
+    except Exception:
+        return None
 
 # ─── ページ設定（最初に呼ぶ） ───
 st.set_page_config(
@@ -449,6 +493,41 @@ with tabs[1]:
 
         st.write(f"{len(disp_ft)}件を表示中")
 
+        # ── 一括自動取得ボタン ──
+        email_ft = st.session_state.get("pico", {}).get("email", "minekoya0@gmail.com")
+        if st.button("🌐 オープンアクセスPDFを一括自動取得", type="primary"):
+            prog = st.progress(0)
+            status_ph = st.empty()
+            n_ok = 0
+            targets = disp_ft[st.session_state.articles_df.loc[disp_ft.index,"FTステータス"]==""]
+            total_t = len(targets)
+            for i, (idx2, row2) in enumerate(targets.iterrows()):
+                doi2 = row2.get("DOI","")
+                status_ph.info(f"🔍 [{i+1}/{total_t}] {row2['タイトル'][:50]}... を検索中")
+                pdf_url = _get_free_pdf_url(doi2, email_ft)
+                if pdf_url:
+                    try:
+                        status_ph.info(f"⬇️ PDFをダウンロード中: {row2['タイトル'][:50]}...")
+                        resp = _requests.get(pdf_url, timeout=30,
+                                             headers={"User-Agent":"Mozilla/5.0"})
+                        if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
+                            tmp_dir = tempfile.mkdtemp()
+                            sp = os.path.join(tmp_dir, f"{row2['PMID']}.pdf")
+                            with open(sp, "wb") as f:
+                                f.write(resp.content)
+                            st.session_state.articles_df.at[idx2, "FTステータス"] = "PDF済み"
+                            st.session_state.articles_df.at[idx2, "PDFパス"] = sp
+                            n_ok += 1
+                    except Exception:
+                        pass
+                prog.progress((i+1)/max(total_t,1))
+            status_ph.empty()
+            prog.empty()
+            st.success(f"✅ 自動取得完了: {n_ok}/{total_t}件 取得できました（残りは手動でアップロードしてください）")
+            st.rerun()
+
+        st.divider()
+
         for idx, row in disp_ft.iterrows():
             ft_status = st.session_state.articles_df.at[idx, "FTステータス"]
             st_icon = {"PDF済み":"✅","入手不可":"❌"}.get(ft_status, "⏳")
@@ -458,37 +537,36 @@ with tabs[1]:
                 if row.get('DOI'):
                     doi_url = f"https://doi.org/{row['DOI']}"
                     st.markdown(f"**DOI:** [{doi_url}]({doi_url})")
-                    # PMC無料リンク
-                    st.caption("💡 無料PDF: [PubMed Central](https://www.ncbi.nlm.nih.gov/pmc/) または [Unpaywall](https://unpaywall.org/) で検索")
 
-                uploaded_pdf = st.file_uploader(
-                    "PDFをアップロード", type=["pdf"], key=f"pdf_up_{idx}"
-                )
-                if uploaded_pdf is not None:
-                    # /tmp を使用（Streamlit Cloud で書き込み可能）
-                    tmp_dir = tempfile.mkdtemp()
-                    save_path = os.path.join(tmp_dir, f"{row['PMID']}.pdf")
-                    with open(save_path, "wb") as f:
-                        f.write(uploaded_pdf.read())
-                    st.session_state.articles_df.at[idx, "FTステータス"] = "PDF済み"
-                    st.session_state.articles_df.at[idx, "PDFパス"] = save_path
-                    st.success(f"✅ アップロード完了: {uploaded_pdf.name}")
-                    st.rerun()
-
-                bc1, bc2 = st.columns(2)
                 if ft_status == "PDF済み":
-                    bc1.success("✅ PDF済み")
-                    if bc2.button("↩️ リセット", key=f"ft_rst_{idx}"):
+                    st.success("✅ PDF取得済み")
+                    if st.button("↩️ リセット", key=f"ft_rst_{idx}"):
                         st.session_state.articles_df.at[idx, "FTステータス"] = ""
                         st.session_state.articles_df.at[idx, "PDFパス"] = ""
                         st.rerun()
                 elif ft_status == "入手不可":
-                    bc1.error("❌ 入手不可")
-                    if bc2.button("↩️ リセット", key=f"ft_rst2_{idx}"):
+                    st.error("❌ 入手不可（除外）")
+                    if st.button("↩️ リセット", key=f"ft_rst2_{idx}"):
                         st.session_state.articles_df.at[idx, "FTステータス"] = ""
                         st.rerun()
                 else:
-                    if bc1.button("❌ 入手不可（除外）", key=f"ft_na_{idx}"):
+                    # 手動アップロード
+                    st.info("📎 PDFを手動でアップロードしてください")
+                    uploaded_pdf = st.file_uploader(
+                        "PDFをアップロード", type=["pdf"], key=f"pdf_up_{idx}"
+                    )
+                    if uploaded_pdf is not None:
+                        with st.spinner(f"⏳ {uploaded_pdf.name} をアップロード中... しばらくお待ちください"):
+                            tmp_dir = tempfile.mkdtemp()
+                            save_path = os.path.join(tmp_dir, f"{row['PMID']}.pdf")
+                            with open(save_path, "wb") as f:
+                                f.write(uploaded_pdf.read())
+                            st.session_state.articles_df.at[idx, "FTステータス"] = "PDF済み"
+                            st.session_state.articles_df.at[idx, "PDFパス"] = save_path
+                        st.success(f"✅ アップロード完了: {uploaded_pdf.name}")
+                        st.rerun()
+
+                    if st.button("❌ 入手不可（除外）", key=f"ft_na_{idx}"):
                         st.session_state.articles_df.at[idx, "FTステータス"] = "入手不可"
                         st.session_state.articles_df.at[idx, "除外理由"] = "Full text not available"
                         st.rerun()
