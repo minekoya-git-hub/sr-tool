@@ -426,7 +426,7 @@ with tabs[1]:
                             mapped = "採択" if dec in ("採択", "要確認") else "除外"
                             st.session_state.articles_df.at[idx, "一次スクリーニング"] = mapped
                             st.session_state.articles_df.at[idx, "AI判定"] = dec
-                            st.session_state.articles_df.at[idx, "AIスコア"] = res["score"]
+                            st.session_state.articles_df.at[idx, "AIスコア"] = str(res["score"])
                             st.session_state.articles_df.at[idx, "AI理由"] = res["reason"]
                             if dec == "除外":
                                 st.session_state.articles_df.at[idx, "除外理由"] = res["reason"]
@@ -526,7 +526,8 @@ with tabs[1]:
 
         # 列初期化
         for col, default in [("FTステータス",""), ("PDFパス",""),
-                              ("FT判定",""), ("FT判定理由",""), ("FTスコア","")]:
+                              ("FT判定",""), ("FT判定理由",""), ("FTスコア",""),
+                              ("AI判定",""), ("AIスコア",""), ("AI理由","")]:
             if col not in st.session_state.articles_df.columns:
                 st.session_state.articles_df[col] = default
 
@@ -624,7 +625,7 @@ with tabs[1]:
                             mapped = "採択" if dec in ("採択", "要確認") else "除外"
                             st.session_state.articles_df.at[midx, "FT判定"] = mapped
                             st.session_state.articles_df.at[midx, "FT判定理由"] = res["reason"]
-                            st.session_state.articles_df.at[midx, "FTスコア"] = res["score"]
+                            st.session_state.articles_df.at[midx, "FTスコア"] = str(res["score"])
                             # 入手不可文献は自動的に除外
                             if st.session_state.articles_df.at[midx, "FTステータス"] == "入手不可":
                                 st.session_state.articles_df.at[midx, "FT判定"] = "除外"
