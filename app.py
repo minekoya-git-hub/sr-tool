@@ -156,6 +156,76 @@ def _autosave():
     """重要な操作のたびに呼ぶ"""
     _save_session(st.session_state["_sid"], dict(st.session_state))
 
+
+def _auto_reflect_extraction_to_meta():
+    """
+    extraction_results の確定済み（or 全件）エントリを meta_rows へ自動反映。
+    - _direct=True: OR/RR/HR の直接値を持つ行
+    - 2x2 データ: ee/ne/ec/nc を持つ行
+    抽出済みで meta_rows にまだない論文のみ追加（重複しない）。
+    """
+    existing_ids = {r.get("study_id", "") for r in st.session_state.get("meta_rows", [])}
+
+    added = 0
+    for pmid, outcomes in st.session_state.get("extraction_results", {}).items():
+        if not outcomes:
+            continue
+
+        # 論文タイトル/著者/年を取得
+        study_label = f"PMID{pmid}"
+        df_ref = st.session_state.get("search_results")
+        if df_ref is not None and not df_ref.empty:
+            hit = df_ref[df_ref["PMID"].astype(str) == pmid]
+            if not hit.empty:
+                yr   = str(hit.iloc[0].get("年", ""))
+                auth = str(hit.iloc[0].get("著者", ""))
+                first_auth = auth.split(",")[0].split(" ")[-1] if auth else ""
+                study_label = f"{first_auth} {yr}".strip() or study_label
+
+        if study_label in existing_ids:
+            continue
+
+        # outcomes の中から最初の有効行を代表として採用
+        for o in outcomes:
+            eff  = o.get("_effect")
+            cil  = o.get("_ci_lower")
+            ciu  = o.get("_ci_upper")
+            ee   = o.get("ee") or o.get("events_exp")
+            ne   = o.get("ne") or o.get("total_exp")
+            ec   = o.get("ec") or o.get("events_ctrl")
+            nc   = o.get("nc") or o.get("total_ctrl")
+
+            if eff and cil and ciu:
+                # 直接効果量
+                new_row = {
+                    "study_id": study_label,
+                    "_direct": True,
+                    "_effect": float(eff),
+                    "_ci_lower": float(cil),
+                    "_ci_upper": float(ciu),
+                }
+                st.session_state.meta_rows.append(new_row)
+                existing_ids.add(study_label)
+                added += 1
+                break
+            elif ee and ne and ec and nc:
+                # 2x2 テーブルデータ
+                new_row = {
+                    "study_id": study_label,
+                    "_direct": False,
+                    "ee": str(ee),
+                    "ne": str(ne),
+                    "ec": str(ec),
+                    "nc": str(nc),
+                }
+                st.session_state.meta_rows.append(new_row)
+                existing_ids.add(study_label)
+                added += 1
+                break
+
+    if added:
+        st.toast(f"📊 {added}件の抽出データをメタアナリシスに反映しました", icon="✅")
+
 # ─── タイトル ───
 st.markdown("## 🏃 スポーツ傷害リスク因子 SR自動化ツール")
 st.caption("PubMed検索 ＋ 手動インポート → スクリーニング → データ抽出 → メタアナリシス → 出力")
@@ -962,24 +1032,55 @@ with tabs[3]:
             if st.button("🤖 AI一括自動抽出（全論文）", type="primary"):
                 prog_ex = st.progress(0)
                 stat_ex = st.empty()
+                _results_log = []   # (pmid, title, status, detail)
+                _cnt_ok = _cnt_skip = _cnt_err = 0
+
                 for i, (idx, row) in enumerate(pdf_df_ex.iterrows()):
                     pmid = str(row["PMID"])
+                    title_short = str(row["タイトル"])[:45]
                     pdf_path = row.get("PDFパス", "")
+
+                    # すでに抽出済みはスキップ
                     if pmid in st.session_state.extraction_results:
                         prog_ex.progress((i+1)/total_pdfs)
+                        stat_ex.text(f"⏭️ スキップ ({i+1}/{total_pdfs}): {title_short}…（抽出済み）")
+                        _results_log.append((pmid, title_short, "skip", "抽出済み"))
+                        _cnt_skip += 1
                         continue
+
                     if pdf_path and os.path.exists(pdf_path):
-                        stat_ex.text(f"抽出中 ({i+1}/{total_pdfs}): {row['タイトル'][:50]}...")
+                        stat_ex.text(f"🔍 抽出中 ({i+1}/{total_pdfs}): {title_short}…")
                         try:
                             data = extract_from_pdf(pdf_path, pmid=pmid, title=row["タイトル"])
                             st.session_state.extraction_results[pmid] = data.outcomes
+                            n_out = len(data.outcomes) if data.outcomes else 0
+                            _results_log.append((pmid, title_short, "ok", f"{n_out}件抽出"))
+                            _cnt_ok += 1
                         except Exception as e:
                             st.session_state.extraction_results[pmid] = []
-                            st.warning(f"PMID {pmid}: エラー ({e})")
+                            _results_log.append((pmid, title_short, "err", str(e)[:80]))
+                            _cnt_err += 1
                     else:
-                        st.warning(f"PMID {pmid}: PDFが見つかりません（スクリーニングでPDF取得してください）")
+                        _results_log.append((pmid, title_short, "err", "PDFが見つかりません"))
+                        _cnt_err += 1
+
                     prog_ex.progress((i+1)/total_pdfs)
-                stat_ex.text("✅ AI抽出完了")
+
+                # ── 完了サマリー
+                stat_ex.empty()
+                prog_ex.progress(1.0)
+                st.success(
+                    f"✅ AI抽出完了 — 成功: {_cnt_ok}件 ／ スキップ: {_cnt_skip}件 ／ 失敗: {_cnt_err}件"
+                )
+
+                # 詳細ログ（expander）
+                with st.expander("📋 抽出ログ詳細", expanded=(_cnt_err > 0)):
+                    for pmid_l, ttl_l, st_l, det_l in _results_log:
+                        icon = {"ok":"✅","skip":"⏭️","err":"❌"}[st_l]
+                        st.markdown(f"{icon} **PMID {pmid_l}** — {ttl_l}  \n　→ {det_l}")
+
+                # ── meta_rows へ自動反映
+                _auto_reflect_extraction_to_meta()
                 _autosave()
                 st.rerun()
 
@@ -1410,11 +1511,26 @@ with tabs[4]:
 
     # ── 結果表示（JBI SUMARI スタイル） ─────────────────
     if st.session_state.meta_result:
-        result  = st.session_state.meta_result
+        result    = st.session_state.meta_result
         studies_w = st.session_state.meta_studies
+        rows_w    = st.session_state.meta_rows[:len(studies_w)]
 
-        # フォレストプロット
         ci_studies = [s for s in studies_w if s.ci_lower and s.ci_upper]
+        ci_rows    = rows_w[:len(ci_studies)]
+
+        # 2x2 データ列（あれば渡す）
+        _ee = [int(r.get("ee",0)) for r in ci_rows if not r.get("_direct")] or None
+        _ne = [int(r.get("ne",0)) for r in ci_rows if not r.get("_direct")] or None
+        _ec = [int(r.get("ec",0)) for r in ci_rows if not r.get("_direct")] or None
+        _nc = [int(r.get("nc",0)) for r in ci_rows if not r.get("_direct")] or None
+
+        # method ラベル（JBI SUMARI 風）
+        _abbrev = {"Mantel-Haenszel":"M-H","Inverse Variance":"IV",
+                   "Peto Odds Ratio":"Peto","DerSimonian and Laird (IV)":"DL",
+                   "Restricted Maximum Likelihood":"REML"}
+        method_abbr = _abbrev.get(method_sel, method_sel[:4])
+        method_label = f"{method_abbr}, {model_sel}, {ci_sel}"
+
         buf = make_forest_plot(
             study_ids=[s.study_id for s in ci_studies],
             effects=[s.effect for s in ci_studies],
@@ -1425,57 +1541,29 @@ with tabs[4]:
             pooled_ci_lower=result.ci_lower,
             pooled_ci_upper=result.ci_upper,
             measure_type=result.measure_type,
-            title=f"{st.session_state.get('selected_factor','') or ''} — {method_sel}, {model_sel}, {ci_sel}",
+            method_label=method_label,
+            title=f"{st.session_state.get('selected_factor','') or ''} — {method_label}",
             i2=result.i2, tau2=result.tau2,
+            q_stat=result.q_stat, q_pvalue=result.q_pvalue,
+            n_studies=result.n_studies,
+            events_exp=_ee, total_exp=_ne,
+            events_ctrl=_ec, total_ctrl=_nc,
         )
-        st.session_state.selected_factor = st.session_state.get("selected_factor", "")
 
-        # 数値テーブル（JBI SUMARI 下部テーブル）
-        _ci_lvl = ci_sel.replace("%","")
-        header_cols = st.columns([3, 1.2, 1.2, 1.2, 1.2, 2, 2])
-        for h, lbl in zip(header_cols,
-            ["Study", "Exp Events", "Exp Total", "Ctrl Events", "Ctrl Total",
-             "Weight", f"{result.measure_type}, {method_sel[:2]}, {ci_sel}"]):
-            h.markdown(f"**{lbl}**")
-        st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
-
-        for s, r in zip(ci_studies, st.session_state.meta_rows[:len(ci_studies)]):
-            rc = st.columns([3, 1.2, 1.2, 1.2, 1.2, 2, 2])
-            rc[0].write(s.study_id[:40])
-            if is_binary and not r.get("_direct"):
-                rc[1].write(str(r.get("ee","")))
-                rc[2].write(str(r.get("ne","")))
-                rc[3].write(str(r.get("ec","")))
-                rc[4].write(str(r.get("nc","")))
-            else:
-                for i in range(1,5): rc[i].write("—")
-            rc[5].write(f"{s.weight:.2f}%")
-            rc[6].write(f"{s.effect:.2f} [{s.ci_lower:.2f}, {s.ci_upper:.2f}]")
-
-        # Total 行
-        tot_cols = st.columns([3, 1.2, 1.2, 1.2, 1.2, 2, 2])
-        tot_cols[0].markdown("**Total (95% CI)**")
-        tot_total_e = sum(int(r.get("ne",0)) for r in st.session_state.meta_rows if not r.get("_direct"))
-        tot_total_c = sum(int(r.get("nc",0)) for r in st.session_state.meta_rows if not r.get("_direct"))
-        tot_cols[2].markdown(f"**{tot_total_e}**")
-        tot_cols[4].markdown(f"**{tot_total_c}**")
-        tot_cols[5].markdown("**100%**")
-        tot_cols[6].markdown(f"**{result.pooled_effect:.2f} [{result.ci_lower:.2f}, {result.ci_upper:.2f}]**")
+        # プロット表示 + Export（Generate ボタン横に Export）
+        pg2.download_button("⬇️ Export PNG", data=buf,
+                            file_name="forest_plot.png", mime="image/png")
+        buf.seek(0)
+        st.image(buf, use_container_width=True)
 
         # 統計サマリー
         lbl_het, icon_het = interpret_heterogeneity(result.i2)
         st.caption(
-            f"Heterogeneity: χ²={result.q_stat:.2f}, df={result.n_studies-1} "
-            f"(P={result.q_pvalue:.3f}); I²={result.i2:.0f}%  {icon_het} {lbl_het}  |  "
-            f"τ²={result.tau2:.4f}  |  Test for overall effect: Z=? (see plot)"
+            f"Heterogeneity: τ²={result.tau2:.2f}; χ²={result.q_stat:.2f}, "
+            f"df={result.n_studies-1} (P={result.q_pvalue:.3f}); I²={result.i2:.0f}%  "
+            f"{icon_het} {lbl_het}"
         )
         st.info(heterogeneity_recommendation(result.i2))
-
-        # プロット表示 + Export
-        st.image(buf, use_container_width=True)
-        buf.seek(0)
-        pg2.download_button("⬇️ Export PNG", data=buf,
-                            file_name="forest_plot.png", mime="image/png")
 
         # 感度分析
         st.markdown("---")
