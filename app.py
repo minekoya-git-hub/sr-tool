@@ -166,7 +166,12 @@ with tabs[0]:
             else:
                 sport = sport_label.split("（")[0].split(" / ")[0].strip()
                 st.caption(f"検索語: `{sport}`")
-            population = st.text_input("対象集団", value="athlete")
+            population = st.text_input(
+                "集団の特性",
+                value="",
+                placeholder="例: professional, youth, recreational, elite",
+                help="対象集団の特性を英語で入力（例: professional athletes, youth players）"
+            )
 
         with col2:
             st.subheader("O（アウトカム）")
@@ -539,11 +544,40 @@ with tabs[1]:
                     st.markdown(f"**DOI:** [{doi_url}]({doi_url})")
 
                 if ft_status == "PDF済み":
-                    st.success("✅ PDF取得済み")
-                    if st.button("↩️ リセット", key=f"ft_rst_{idx}"):
+                    pdf_path = st.session_state.articles_df.at[idx, "PDFパス"]
+                    col_ok, col_rst = st.columns([3, 1])
+                    col_ok.success("✅ PDF取得済み")
+                    if col_rst.button("↩️ リセット", key=f"ft_rst_{idx}"):
                         st.session_state.articles_df.at[idx, "FTステータス"] = ""
                         st.session_state.articles_df.at[idx, "PDFパス"] = ""
                         st.rerun()
+
+                    # ── PDF インラインビューア ──
+                    if pdf_path and os.path.exists(pdf_path):
+                        # ダウンロードボタン
+                        with open(pdf_path, "rb") as f:
+                            pdf_bytes = f.read()
+                        st.download_button(
+                            "⬇️ PDFをダウンロード",
+                            data=pdf_bytes,
+                            file_name=f"{row['PMID']}.pdf",
+                            mime="application/pdf",
+                            key=f"dl_{idx}",
+                        )
+                        # Base64 埋め込みビューア
+                        b64 = base64.b64encode(pdf_bytes).decode()
+                        pdf_display = f"""
+                        <iframe
+                            src="data:application/pdf;base64,{b64}#toolbar=1&navpanes=0&scrollbar=1"
+                            width="100%"
+                            height="700px"
+                            style="border:1px solid #ccc; border-radius:6px;"
+                            type="application/pdf">
+                        </iframe>
+                        """
+                        st.markdown(pdf_display, unsafe_allow_html=True)
+                    else:
+                        st.warning("⚠️ PDFファイルが見つかりません（セッションがリセットされた可能性があります）")
                 elif ft_status == "入手不可":
                     st.error("❌ 入手不可（除外）")
                     if st.button("↩️ リセット", key=f"ft_rst2_{idx}"):
