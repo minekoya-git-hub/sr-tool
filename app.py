@@ -846,7 +846,7 @@ with tabs[2]:
 
 
 # ════════════════════════════════════════════════════
-# TAB 4 : メタアナリシス
+# TAB 4 : メタアナリシス  （JBI SUMARI スタイル）
 # ════════════════════════════════════════════════════
 with tabs[3]:
     from meta_analysis import (
@@ -857,95 +857,280 @@ with tabs[3]:
 
     st.header("④ メタアナリシス")
 
-    extraction_df = st.session_state.get("extraction_df", pd.DataFrame())
+    # セッション初期化
+    if "meta_rows" not in st.session_state:
+        st.session_state.meta_rows = []   # [{study, ee, ne, ec, nc}, ...]
+    if "meta_params" not in st.session_state:
+        st.session_state.meta_params = {
+            "method": "Mantel-Haenszel",
+            "model": "Fixed",
+            "measure": "Odds Ratio",
+            "ci": "95%",
+        }
+
     pico = st.session_state.get("pico", {})
 
-    if extraction_df.empty:
-        st.info("データ抽出が完了していません。")
-        st.stop()
+    # ── Parameters セクション ──────────────────────────
+    with st.expander("⚙️ Parameters", expanded=True):
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        method_sel = pc1.selectbox(
+            "Statistical Method",
+            ["Mantel-Haenszel", "Inverse Variance", "Peto Odds Ratio",
+             "DerSimonian and Laird (IV)", "Restricted Maximum Likelihood"],
+            index=["Mantel-Haenszel", "Inverse Variance", "Peto Odds Ratio",
+                   "DerSimonian and Laird (IV)", "Restricted Maximum Likelihood"]
+                  .index(st.session_state.meta_params["method"]),
+            key="meta_method",
+        )
+        model_sel = pc2.selectbox(
+            "Model",
+            ["Fixed", "Random"],
+            index=["Fixed", "Random"].index(st.session_state.meta_params["model"]),
+            key="meta_model",
+        )
+        measure_sel = pc3.selectbox(
+            "Effect Measure",
+            ["Odds Ratio", "Risk Ratio", "Hazard Ratio", "Mean Difference", "SMD"],
+            index=["Odds Ratio", "Risk Ratio", "Hazard Ratio", "Mean Difference", "SMD"]
+                  .index(st.session_state.meta_params["measure"]),
+            key="meta_measure",
+        )
+        ci_sel = pc4.selectbox(
+            "Confidence Interval",
+            ["95%", "90%", "99%"],
+            index=["95%", "90%", "99%"].index(st.session_state.meta_params["ci"]),
+            key="meta_ci",
+        )
+        st.session_state.meta_params = {
+            "method": method_sel, "model": model_sel,
+            "measure": measure_sel, "ci": ci_sel,
+        }
 
-    has_ci = extraction_df["CI下限"].apply(lambda x: bool(x) and float(x)>0 if x else False)
-    ci_df = extraction_df[has_ci].copy()
+    # ── データ入力テーブル ────────────────────────────
+    st.markdown("---")
 
-    if ci_df.empty:
-        st.warning("95%CI付きデータがありません。")
-        st.stop()
+    # データ抽出タブの結果を自動インポート
+    extraction_df = st.session_state.get("extraction_df", pd.DataFrame())
+    if not extraction_df.empty and not st.session_state.meta_rows:
+        # extraction_df から2x2データを持つ行を自動インポート試行
+        pass   # 手動入力が基本
 
-    risk_factors = [r for r in ci_df["危険因子"].unique().tolist() if str(r).strip()]
-    if not risk_factors:
-        st.warning("危険因子名を入力してください（データ抽出タブ）。")
-        st.stop()
+    # テーブルヘッダー（JBI SUMARI スタイル）
+    is_binary = measure_sel in ("Odds Ratio", "Risk Ratio", "Peto Odds Ratio")
+    if is_binary:
+        col_labels = ["Study", "Events (Exp)", "Total (Exp)", "Events (Ctrl)", "Total (Ctrl)"]
+    else:
+        col_labels = ["Study", "Mean (Exp)", "SD (Exp)", "n (Exp)", "Mean (Ctrl)", "SD (Ctrl)", "n (Ctrl)"]
 
-    selected_factor = st.selectbox("分析する危険因子を選択", risk_factors)
-    factor_df = ci_df[ci_df["危険因子"] == selected_factor]
-    st.write(f"**{selected_factor}** を報告した研究: {len(factor_df)}件")
+    # ヘッダー行
+    if is_binary:
+        hc = st.columns([3, 1.2, 1.2, 1.2, 1.2, 0.8])
+    else:
+        hc = st.columns([2.5, 1, 1, 0.8, 1, 1, 0.8, 0.8])
+    for h, lbl in zip(hc, col_labels):
+        h.markdown(f"**{lbl}**")
 
-    if len(factor_df) < 2:
-        st.warning("2件以上の研究が必要です。")
-        st.stop()
+    st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
 
-    studies = []
-    for _, row in factor_df.iterrows():
-        try:
-            studies.append(StudyData(
-                study_id=f"{row['タイトル'][:30]} ({row['年']})",
-                effect=float(row["効果量"]),
-                ci_lower=float(row["CI下限"]),
-                ci_upper=float(row["CI上限"]),
-                measure_type=str(row["効果量の種類"]),
-            ))
-        except Exception:
-            continue
+    # 既存行の表示・編集
+    rows_to_delete = []
+    for ri, row_d in enumerate(st.session_state.meta_rows):
+        if is_binary:
+            c = st.columns([3, 1.2, 1.2, 1.2, 1.2, 0.8])
+            row_d["study"] = c[0].text_input("", value=row_d.get("study",""), key=f"ms_{ri}",
+                                              label_visibility="collapsed")
+            row_d["ee"] = c[1].number_input("", value=int(row_d.get("ee",0)), min_value=0,
+                                             key=f"ee_{ri}", label_visibility="collapsed")
+            row_d["ne"] = c[2].number_input("", value=int(row_d.get("ne",0)), min_value=0,
+                                             key=f"ne_{ri}", label_visibility="collapsed")
+            row_d["ec"] = c[3].number_input("", value=int(row_d.get("ec",0)), min_value=0,
+                                             key=f"ec_{ri}", label_visibility="collapsed")
+            row_d["nc"] = c[4].number_input("", value=int(row_d.get("nc",0)), min_value=0,
+                                             key=f"nc_{ri}", label_visibility="collapsed")
+            if c[5].button("✕", key=f"del_{ri}"):
+                rows_to_delete.append(ri)
+        else:
+            c = st.columns([2.5, 1, 1, 0.8, 1, 1, 0.8, 0.8])
+            row_d["study"]  = c[0].text_input("", value=row_d.get("study",""), key=f"ms_{ri}", label_visibility="collapsed")
+            row_d["me"]     = c[1].number_input("", value=float(row_d.get("me",0.0)), key=f"me_{ri}", label_visibility="collapsed")
+            row_d["sde"]    = c[2].number_input("", value=float(row_d.get("sde",0.0)), min_value=0.0, key=f"sde_{ri}", label_visibility="collapsed")
+            row_d["ne"]     = c[3].number_input("", value=int(row_d.get("ne",0)), min_value=0, key=f"ne_{ri}", label_visibility="collapsed")
+            row_d["mc"]     = c[4].number_input("", value=float(row_d.get("mc",0.0)), key=f"mc_{ri}", label_visibility="collapsed")
+            row_d["sdc"]    = c[5].number_input("", value=float(row_d.get("sdc",0.0)), min_value=0.0, key=f"sdc_{ri}", label_visibility="collapsed")
+            row_d["nc"]     = c[6].number_input("", value=int(row_d.get("nc",0)), min_value=0, key=f"nc_{ri}", label_visibility="collapsed")
+            if c[7].button("✕", key=f"del_{ri}"):
+                rows_to_delete.append(ri)
 
-    if len(studies) < 2:
-        st.warning("有効データが2件未満です。")
-        st.stop()
+    for ri in reversed(rows_to_delete):
+        st.session_state.meta_rows.pop(ri)
+        st.rerun()
 
-    auto_method, auto_var, auto_reason = auto_select_method(studies)
-    st.info(f"**自動選択** — 手法: {auto_method}  分散: {auto_var}  理由: {auto_reason}")
-    method_code = auto_method
-    var_code = auto_var
-    force_fixed = False
-    with st.expander("🔧 手法を手動で変更"):
-        mc1, mc2, mc3 = st.columns(3)
-        manual_method = mc1.selectbox("統合手法", ["MH（Mantel-Haenszel）","IV（Inverse Variance）","Peto"],
-                                      index=["MH","IV","Peto"].index(auto_method))
-        manual_var = mc2.selectbox("分散推定法", ["REML（推奨）","DL（DerSimonian-Laird）","fixed（固定効果）"],
-                                   index=["REML","DL","fixed"].index(auto_var))
-        force_fixed = mc3.checkbox("固定効果モデルを強制")
-        method_code = manual_method.split("（")[0].strip()
-        var_code = manual_var.split("（")[0].strip()
+    # ＋ Add 行
+    if is_binary:
+        ac = st.columns([3, 1.2, 1.2, 1.2, 1.2, 0.8])
+        new_study = ac[0].text_input("", placeholder="Select or type citation...",
+                                     key="new_study", label_visibility="collapsed")
+        new_ee = ac[1].number_input("", value=0, min_value=0, key="new_ee", label_visibility="collapsed")
+        new_ne = ac[2].number_input("", value=0, min_value=0, key="new_ne", label_visibility="collapsed")
+        new_ec = ac[3].number_input("", value=0, min_value=0, key="new_ec", label_visibility="collapsed")
+        new_nc = ac[4].number_input("", value=0, min_value=0, key="new_nc", label_visibility="collapsed")
+        if ac[5].button("＋ Add", type="primary"):
+            if new_study:
+                st.session_state.meta_rows.append({
+                    "study": new_study, "ee": new_ee, "ne": new_ne,
+                    "ec": new_ec, "nc": new_nc,
+                })
+                st.rerun()
+    else:
+        ac = st.columns([2.5, 1, 1, 0.8, 1, 1, 0.8, 0.8])
+        new_study = ac[0].text_input("", placeholder="Study...", key="new_study", label_visibility="collapsed")
+        new_me  = ac[1].number_input("", value=0.0, key="new_me",  label_visibility="collapsed")
+        new_sde = ac[2].number_input("", value=0.0, key="new_sde", label_visibility="collapsed", min_value=0.0)
+        new_ne2 = ac[3].number_input("", value=0,   key="new_ne2", label_visibility="collapsed", min_value=0)
+        new_mc  = ac[4].number_input("", value=0.0, key="new_mc",  label_visibility="collapsed")
+        new_sdc = ac[5].number_input("", value=0.0, key="new_sdc", label_visibility="collapsed", min_value=0.0)
+        new_nc  = ac[6].number_input("", value=0,   key="new_nc",  label_visibility="collapsed", min_value=0)
+        if ac[7].button("＋ Add", type="primary"):
+            if new_study:
+                st.session_state.meta_rows.append({
+                    "study": new_study, "me": new_me, "sde": new_sde, "ne": new_ne2,
+                    "mc": new_mc, "sdc": new_sdc, "nc": new_nc,
+                })
+                st.rerun()
 
-    if st.button("▶ メタアナリシスを実行", type="primary"):
-        try:
-            result, _, _, _ = run_meta_analysis(studies, method=method_code,
-                                                variance_method=var_code, force_fixed=force_fixed)
-            st.session_state.meta_result = result
-            st.session_state.meta_studies = studies
-            st.session_state.selected_factor = selected_factor
-        except Exception as e:
-            st.error(f"エラー: {e}")
+    # OR/RR用に meta_rows から extraction_df 互換データも取り込む
+    if not extraction_df.empty:
+        with st.expander("📥 データ抽出タブの結果からインポート"):
+            st.caption("データ抽出タブで入力した効果量・CIを直接メタアナリシスに使います。")
+            risk_factors_avail = [r for r in extraction_df["危険因子"].unique() if str(r).strip()]
+            if risk_factors_avail:
+                sel_rf = st.selectbox("危険因子を選択", risk_factors_avail, key="meta_import_rf")
+                if st.button("インポート", key="do_import_rf"):
+                    rf_rows = extraction_df[extraction_df["危険因子"] == sel_rf]
+                    for _, rr in rf_rows.iterrows():
+                        try:
+                            st.session_state.meta_rows.append({
+                                "study": f"{str(rr['タイトル'])[:25]} ({rr['年']})",
+                                "_effect": float(rr["効果量"]),
+                                "_ci_lower": float(rr["CI下限"]) if rr["CI下限"] else None,
+                                "_ci_upper": float(rr["CI上限"]) if rr["CI上限"] else None,
+                                "_measure": str(rr["効果量の種類"]),
+                                "_direct": True,
+                            })
+                        except Exception:
+                            pass
+                    st.rerun()
 
+    st.markdown("---")
+
+    # ── Plot セクション ────────────────────────────────
+    st.markdown("### 📊 Plot")
+    pg1, pg2 = st.columns([1, 6])
+
+    if pg1.button("📊 Generate", type="primary"):
+        rows = st.session_state.meta_rows
+        if len(rows) < 2:
+            st.error("2件以上の研究を追加してください。")
+        else:
+            # 「_direct」フラグがある行（効果量直接入力）と2x2テーブル行を区別
+            studies = []
+            measure_type = measure_sel.split()[0]  # "Odds" → "OR" 等に変換
+            _mt_map = {"Odds": "OR", "Risk": "RR", "Hazard": "HR", "Mean": "MD", "SMD": "SMD"}
+            mt = _mt_map.get(measure_type, measure_type)
+
+            import math
+            for r in rows:
+                try:
+                    if r.get("_direct"):
+                        # 効果量直接入力
+                        eff = r["_effect"]
+                        cil = r.get("_ci_lower") or 0.0
+                        ciu = r.get("_ci_upper") or 0.0
+                        # log変換（OR/RR/HR用）
+                        if mt in ("OR","RR","HR") and eff > 0:
+                            log_e = math.log(eff)
+                            se = (math.log(ciu) - math.log(cil)) / (2*1.96) if (cil>0 and ciu>0) else 0.1
+                        else:
+                            log_e = eff
+                            se = (ciu - cil) / (2*1.96) if (ciu > cil) else 0.1
+                        studies.append(StudyData(
+                            study_id=r["study"], effect=log_e,
+                            ci_lower=cil, ci_upper=ciu,
+                            measure_type=mt,
+                        ))
+                    elif is_binary:
+                        # 2x2テーブルから効果量を計算
+                        ee, ne, ec, nc = int(r["ee"]), int(r["ne"]), int(r["ec"]), int(r["nc"])
+                        if ne > 0 and nc > 0 and ee <= ne and ec <= nc:
+                            if mt in ("OR","MH"):
+                                if ee > 0 and ec > 0 and (ne-ee) > 0 and (nc-ec) > 0:
+                                    or_val = (ee*(nc-ec)) / (ec*(ne-ee))
+                                    log_or = math.log(or_val)
+                                    se = math.sqrt(1/ee + 1/(ne-ee) + 1/ec + 1/(nc-ec))
+                                    ci_l = math.exp(log_or - 1.96*se)
+                                    ci_u = math.exp(log_or + 1.96*se)
+                                    studies.append(StudyData(
+                                        study_id=r["study"], effect=or_val,
+                                        ci_lower=ci_l, ci_upper=ci_u, measure_type="OR",
+                                    ))
+                            elif mt == "RR":
+                                if ee > 0 and ne > 0 and ec > 0 and nc > 0:
+                                    rr_val = (ee/ne) / (ec/nc)
+                                    se = math.sqrt(1/ee - 1/ne + 1/ec - 1/nc)
+                                    ci_l = math.exp(math.log(rr_val) - 1.96*se)
+                                    ci_u = math.exp(math.log(rr_val) + 1.96*se)
+                                    studies.append(StudyData(
+                                        study_id=r["study"], effect=rr_val,
+                                        ci_lower=ci_l, ci_upper=ci_u, measure_type="RR",
+                                    ))
+                    else:
+                        # 連続変数（MD/SMD）
+                        me, sde, ne2 = float(r["me"]), float(r["sde"]), int(r["ne"])
+                        mc2, sdc, nc2 = float(r["mc"]), float(r["sdc"]), int(r["nc"])
+                        if ne2 > 0 and nc2 > 0 and sde > 0 and sdc > 0:
+                            md = me - mc2
+                            se = math.sqrt(sde**2/ne2 + sdc**2/nc2)
+                            ci_l = md - 1.96*se
+                            ci_u = md + 1.96*se
+                            studies.append(StudyData(
+                                study_id=r["study"], effect=md,
+                                ci_lower=ci_l, ci_upper=ci_u, measure_type="MD",
+                            ))
+                except Exception:
+                    continue
+
+            if len(studies) < 2:
+                st.error("有効なデータが2件未満です（数値を確認してください）。")
+            else:
+                _method_map = {
+                    "Mantel-Haenszel": "MH", "Inverse Variance": "IV",
+                    "Peto Odds Ratio": "Peto", "DerSimonian and Laird (IV)": "IV",
+                    "Restricted Maximum Likelihood": "IV",
+                }
+                _var_map = {
+                    "Mantel-Haenszel": "fixed", "Inverse Variance": "REML",
+                    "Peto Odds Ratio": "fixed", "DerSimonian and Laird (IV)": "DL",
+                    "Restricted Maximum Likelihood": "REML",
+                }
+                force_fixed = (model_sel == "Fixed")
+                try:
+                    result, _, _, _ = run_meta_analysis(
+                        studies,
+                        method=_method_map.get(method_sel, "MH"),
+                        variance_method=_var_map.get(method_sel, "REML"),
+                        force_fixed=force_fixed,
+                    )
+                    st.session_state.meta_result = result
+                    st.session_state.meta_studies = studies
+                except Exception as e:
+                    st.error(f"計算エラー: {e}")
+
+    # ── 結果表示（JBI SUMARI スタイル） ─────────────────
     if st.session_state.meta_result:
-        result = st.session_state.meta_result
+        result  = st.session_state.meta_result
         studies_w = st.session_state.meta_studies
 
-        r1,r2,r3,r4 = st.columns(4)
-        r1.metric("プール効果量", f"{result.pooled_effect:.2f}")
-        r2.metric("95%CI", f"{result.ci_lower:.2f}–{result.ci_upper:.2f}")
-        lbl, icon = interpret_heterogeneity(result.i2)
-        r3.metric("I²", f"{result.i2}%  {icon} {lbl}")
-        r4.metric("研究数", result.n_studies)
-        st.write(f"Q={result.q_stat}  p={result.q_pvalue}  τ²={result.tau2}")
-        st.info(heterogeneity_recommendation(result.i2))
-
-        weight_rows = [{"研究": s.study_id, "効果量": s.effect,
-                        "CI下限": s.ci_lower, "CI上限": s.ci_upper,
-                        "重み(%)": f"{s.weight:.1f}%"} for s in studies_w]
-        st.dataframe(pd.DataFrame(weight_rows), use_container_width=True)
-
         # フォレストプロット
-        st.subheader("🌲 フォレストプロット")
         ci_studies = [s for s in studies_w if s.ci_lower and s.ci_upper]
         buf = make_forest_plot(
             study_ids=[s.study_id for s in ci_studies],
@@ -957,25 +1142,68 @@ with tabs[3]:
             pooled_ci_lower=result.ci_lower,
             pooled_ci_upper=result.ci_upper,
             measure_type=result.measure_type,
-            title=f"{selected_factor} — {result.measure_type}",
+            title=f"{st.session_state.get('selected_factor','') or ''} — {method_sel}, {model_sel}, {ci_sel}",
             i2=result.i2, tau2=result.tau2,
         )
+        st.session_state.selected_factor = st.session_state.get("selected_factor", "")
+
+        # 数値テーブル（JBI SUMARI 下部テーブル）
+        _ci_lvl = ci_sel.replace("%","")
+        header_cols = st.columns([3, 1.2, 1.2, 1.2, 1.2, 2, 2])
+        for h, lbl in zip(header_cols,
+            ["Study", "Exp Events", "Exp Total", "Ctrl Events", "Ctrl Total",
+             "Weight", f"{result.measure_type}, {method_sel[:2]}, {ci_sel}"]):
+            h.markdown(f"**{lbl}**")
+        st.markdown('<hr style="margin:4px 0">', unsafe_allow_html=True)
+
+        for s, r in zip(ci_studies, st.session_state.meta_rows[:len(ci_studies)]):
+            rc = st.columns([3, 1.2, 1.2, 1.2, 1.2, 2, 2])
+            rc[0].write(s.study_id[:40])
+            if is_binary and not r.get("_direct"):
+                rc[1].write(str(r.get("ee","")))
+                rc[2].write(str(r.get("ne","")))
+                rc[3].write(str(r.get("ec","")))
+                rc[4].write(str(r.get("nc","")))
+            else:
+                for i in range(1,5): rc[i].write("—")
+            rc[5].write(f"{s.weight:.2f}%")
+            rc[6].write(f"{s.effect:.2f} [{s.ci_lower:.2f}, {s.ci_upper:.2f}]")
+
+        # Total 行
+        tot_cols = st.columns([3, 1.2, 1.2, 1.2, 1.2, 2, 2])
+        tot_cols[0].markdown("**Total (95% CI)**")
+        tot_total_e = sum(int(r.get("ne",0)) for r in st.session_state.meta_rows if not r.get("_direct"))
+        tot_total_c = sum(int(r.get("nc",0)) for r in st.session_state.meta_rows if not r.get("_direct"))
+        tot_cols[2].markdown(f"**{tot_total_e}**")
+        tot_cols[4].markdown(f"**{tot_total_c}**")
+        tot_cols[5].markdown("**100%**")
+        tot_cols[6].markdown(f"**{result.pooled_effect:.2f} [{result.ci_lower:.2f}, {result.ci_upper:.2f}]**")
+
+        # 統計サマリー
+        lbl_het, icon_het = interpret_heterogeneity(result.i2)
+        st.caption(
+            f"Heterogeneity: χ²={result.q_stat:.2f}, df={result.n_studies-1} "
+            f"(P={result.q_pvalue:.3f}); I²={result.i2:.0f}%  {icon_het} {lbl_het}  |  "
+            f"τ²={result.tau2:.4f}  |  Test for overall effect: Z=? (see plot)"
+        )
+        st.info(heterogeneity_recommendation(result.i2))
+
+        # プロット表示 + Export
         st.image(buf, use_container_width=True)
         buf.seek(0)
-        st.download_button("📥 PNG ダウンロード", data=buf,
-                           file_name=f"forest_{selected_factor}.png", mime="image/png")
+        pg2.download_button("⬇️ Export PNG", data=buf,
+                            file_name="forest_plot.png", mime="image/png")
 
         # 感度分析
-        st.divider()
-        st.subheader("🔍 感度分析")
+        st.markdown("---")
+        st.subheader("🔍 感度分析（Sensitivity Analysis）")
         bias_map = st.session_state.get("bias_results", {})
-
-        df_for_sa = st.session_state.get("extraction_df", pd.DataFrame())
         sa_rows = []
         for s in studies_w:
             matched_overall = "未評価"
+            df_for_sa = st.session_state.get("extraction_df", pd.DataFrame())
             for _, ex_row in df_for_sa.iterrows():
-                if str(ex_row.get("タイトル",""))[:30] in s.study_id:
+                if str(ex_row.get("タイトル",""))[:25] in s.study_id:
                     pmid_m = str(ex_row["PMID"])
                     if pmid_m in bias_map:
                         matched_overall = bias_map[pmid_m].overall
@@ -985,9 +1213,9 @@ with tabs[3]:
             sa_rows.append({"study": s, "bias": matched_overall,
                              "excluded": st.session_state.sa_exclusions[s.study_id]})
 
-        hc1, hc2, hc3, hc4 = st.columns([4,2,2,1])
-        hc1.markdown("**研究**"); hc2.markdown("**効果量 (95%CI)**")
-        hc3.markdown("**バイアス**"); hc4.markdown("**含める**")
+        hc = st.columns([4, 2, 2, 1])
+        hc[0].markdown("**Study**"); hc[1].markdown("**Effect (95%CI)**")
+        hc[2].markdown("**Risk of Bias**"); hc[3].markdown("**Include**")
         for row_d in sa_rows:
             s = row_d["study"]
             bias_icon = {"Low":"🟢","Moderate":"🟡","High":"🔴","Unclear":"⚪"}.get(row_d["bias"],"—")
@@ -995,18 +1223,23 @@ with tabs[3]:
             c1.write(s.study_id[:45])
             c2.write(f"{s.effect:.2f} ({s.ci_lower:.2f}–{s.ci_upper:.2f})")
             c3.write(f"{bias_icon} {row_d['bias']}")
-            inc = c4.checkbox("含める", value=not row_d["excluded"],
+            inc = c4.checkbox("", value=not row_d["excluded"],
                               key=f"sa_{s.study_id}", label_visibility="collapsed")
             st.session_state.sa_exclusions[s.study_id] = not inc
 
-        inc_studies = [r["study"] for r in sa_rows if not st.session_state.sa_exclusions[r["study"].study_id]]
+        inc_studies = [r["study"] for r in sa_rows
+                       if not st.session_state.sa_exclusions[r["study"].study_id]]
         if st.button("▶ 感度分析を実行", key="run_sa"):
             if len(inc_studies) < 2:
                 st.error("2件以上必要です。")
             else:
                 try:
-                    sa_res, *_ = run_meta_analysis(inc_studies, method=method_code,
-                                                   variance_method=var_code, force_fixed=force_fixed)
+                    sa_res, *_ = run_meta_analysis(
+                        inc_studies,
+                        method=_method_map.get(method_sel,"MH"),
+                        variance_method=_var_map.get(method_sel,"REML"),
+                        force_fixed=(model_sel=="Fixed"),
+                    )
                     st.session_state.sa_result = sa_res
                     st.session_state.sa_included = inc_studies
                 except Exception as e:
@@ -1015,19 +1248,19 @@ with tabs[3]:
         if st.session_state.sa_result:
             sa_res = st.session_state.sa_result
             comp = {
-                "": ["全研究（メイン）", f"感度分析（n={len(st.session_state.sa_included)}）"],
-                "効果量": [f"{result.pooled_effect:.2f}", f"{sa_res.pooled_effect:.2f}"],
-                "95%CI": [f"{result.ci_lower:.2f}–{result.ci_upper:.2f}",
-                          f"{sa_res.ci_lower:.2f}–{sa_res.ci_upper:.2f}"],
+                "": ["Main analysis", f"Sensitivity (n={len(st.session_state.sa_included)})"],
+                "Effect": [f"{result.pooled_effect:.2f}", f"{sa_res.pooled_effect:.2f}"],
+                f"{ci_sel} CI": [f"{result.ci_lower:.2f}–{result.ci_upper:.2f}",
+                                  f"{sa_res.ci_lower:.2f}–{sa_res.ci_upper:.2f}"],
                 "I²": [f"{result.i2:.1f}%", f"{sa_res.i2:.1f}%"],
             }
             st.dataframe(pd.DataFrame(comp), use_container_width=True, hide_index=True)
             m_sig = not(result.ci_lower<=1.0<=result.ci_upper)
             s_sig = not(sa_res.ci_lower<=1.0<=sa_res.ci_upper)
             if m_sig == s_sig:
-                st.success("✅ 感度分析にロバスト（結論不変）")
+                st.success("✅ Robust to sensitivity analysis")
             else:
-                st.warning("⚠️ Highバイアス除外で統計的有意性が変化しました")
+                st.warning("⚠️ Statistical significance changed after excluding high-bias studies")
 
 
 # ════════════════════════════════════════════════════
