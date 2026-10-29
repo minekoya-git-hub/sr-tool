@@ -164,9 +164,9 @@ st.caption("PubMed検索 ＋ 手動インポート → スクリーニング →
 TAB_LABELS = [
     "① PICO & 検索",
     "② スクリーニング",
-    "③ データ抽出",
-    "④ メタアナリシス",
-    "⑤ バイアス評価",
+    "③ バイアス評価",
+    "④ データ抽出",
+    "⑤ メタアナリシス",
     "⑥ 出力",
 ]
 # step (1-6) → tab index (0-5)
@@ -744,111 +744,389 @@ with tabs[1]:
 
 
 # ════════════════════════════════════════════════════
-# TAB 3 : データ抽出
+# TAB 3 : バイアス評価  ← 旧TAB5をここへ移動
 # ════════════════════════════════════════════════════
 with tabs[2]:
+    import pymupdf
+    from bias_assessment import (
+        auto_assess_bias, compute_overall,
+        QUIPS_DOMAINS, RATING_OPTIONS, RATING_ICONS,
+    )
+
+    st.header("③ バイアスリスク評価（QUIPS）")
+    st.caption("採択文献のPDFをAIが自動評価。確認・上書き後に次のデータ抽出へ進めます。")
+
+    df = st.session_state.articles_df
+    if df is None:
+        st.info("文献がありません。")
+    else:
+        # 採択かつPDF取得済みの文献
+        if "FTステータス" in df.columns:
+            pdf_df_bias = df[(df["一次スクリーニング"] == "採択") & (df["FTステータス"] == "PDF済み")]
+        else:
+            pdf_df_bias = df[df["一次スクリーニング"] == "採択"]
+
+        total_p = len(pdf_df_bias)
+        assessed = len(st.session_state.bias_results)
+        confirmed = sum(st.session_state.bias_confirmed.values())
+
+        # ── JBI SUMARI スタイル統計バー ──
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("対象論文", total_p)
+        mc2.metric("AI評価済み", assessed)
+        mc3.metric("確認完了", confirmed)
+
+        # Export ボタン（右寄せ）
+        _bc1, _bc2 = st.columns([6, 1])
+        # （DOCX export は出力タブで）
+
+        st.markdown("---")
+
+        if total_p == 0:
+            st.info("PDFがアップロードされた採択文献がありません。スクリーニングタブでPDFを取得してください。")
+        else:
+            # 🤖 AI一括評価ボタン
+            if st.button("🤖 AI一括評価（全論文）", type="primary"):
+                prog_b = st.progress(0)
+                stat_b = st.empty()
+                for i, (idx, row) in enumerate(pdf_df_bias.iterrows()):
+                    pmid = str(row["PMID"])
+                    pp = row.get("PDFパス", "")
+                    stat_b.text(f"評価中 ({i+1}/{total_p}): {row['タイトル'][:50]}...")
+                    if pp and os.path.exists(pp):
+                        try:
+                            doc = pymupdf.open(pp)
+                            text = "".join(p.get_text() for p in doc)
+                            doc.close()
+                            br = auto_assess_bias(
+                                text, pmid=pmid, title=row["タイトル"],
+                                study_design=row.get("研究デザイン", ""),
+                            )
+                            st.session_state.bias_results[pmid] = br
+                            st.session_state.bias_ratings.setdefault(pmid, {})
+                        except Exception as e:
+                            st.warning(f"PMID {pmid}: {e}")
+                    else:
+                        st.warning(f"PMID {pmid}: PDFが見つかりません")
+                    prog_b.progress((i+1)/total_p)
+                stat_b.text("✅ AI評価完了")
+                _autosave()
+                st.rerun()
+
+            st.divider()
+
+            # ── 論文一覧（JBI SUMARI Appraisal スタイル） ──
+            for idx, row in pdf_df_bias.iterrows():
+                pmid = str(row["PMID"])
+                pp = row.get("PDFパス", "")
+                br = st.session_state.bias_results.get(pmid)
+                is_conf = st.session_state.bias_confirmed.get(pmid, False)
+                conf_icon = "✅" if is_conf else "⏳"
+
+                # 総合評価バッジ
+                if br:
+                    ov = br.overall
+                    ov_icon = RATING_ICONS.get(ov, "⚪")
+                    ov_label = f"{ov_icon} {ov}"
+                else:
+                    ov_label = "未評価"
+
+                with st.expander(
+                    f"{conf_icon}  **{row['タイトル'][:65]}**　　{row['年']}　　{ov_label}"
+                ):
+                    # 著者
+                    if row.get("著者"):
+                        st.caption(str(row.get("著者",""))[:80])
+
+                    left_b, right_b = st.columns([1, 1])
+
+                    with left_b:
+                        st.markdown("**📄 PDF ビューア**")
+                        if pp and os.path.exists(pp):
+                            pk = f"page_{pmid}"
+                            st.session_state.setdefault(pk, 0)
+                            try:
+                                doc_v = pymupdf.open(pp)
+                                total_pg = doc_v.page_count
+                                cur_pg = st.session_state[pk]
+                                n1, n2, n3 = st.columns([1, 2, 1])
+                                if n1.button("◀", key=f"prev_b_{pmid}") and cur_pg > 0:
+                                    st.session_state[pk] -= 1; st.rerun()
+                                n2.markdown(
+                                    f"<div style='text-align:center'>{cur_pg+1}/{total_pg}</div>",
+                                    unsafe_allow_html=True,
+                                )
+                                if n3.button("▶", key=f"next_b_{pmid}") and cur_pg < total_pg - 1:
+                                    st.session_state[pk] += 1; st.rerun()
+                                page_v = doc_v.load_page(cur_pg)
+                                pix = page_v.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5))
+                                st.image(pix.tobytes("png"), use_container_width=True)
+                                doc_v.close()
+                            except Exception as e:
+                                st.error(f"PDF表示エラー: {e}")
+                        else:
+                            st.info("PDFが見つかりません。スクリーニングタブでPDFを取得してください。")
+
+                    with right_b:
+                        st.markdown("**📋 QUIPS バイアス評価**")
+                        if br is None:
+                            st.info("「🤖 AI一括評価」ボタンを押してください。")
+                        else:
+                            ov_map = st.session_state.bias_ratings.get(pmid, {})
+                            for domain in QUIPS_DOMAINS:
+                                d_id = domain["id"]
+                                dr = next((d for d in br.domains if d.domain_id == d_id), None)
+                                if not dr:
+                                    continue
+                                cur_r = ov_map.get(d_id, dr.rating)
+                                icon = RATING_ICONS.get(cur_r, "⚪")
+                                st.markdown(f"**{icon} {domain['label']}**")
+                                st.caption(f"AI判定: {dr.rating} — {dr.reason}")
+                                new_r = st.selectbox(
+                                    "評価", RATING_OPTIONS,
+                                    index=RATING_OPTIONS.index(cur_r) if cur_r in RATING_OPTIONS else 0,
+                                    key=f"rating_{pmid}_{d_id}",
+                                    label_visibility="collapsed",
+                                )
+                                if new_r != cur_r:
+                                    st.session_state.bias_ratings.setdefault(pmid, {})[d_id] = new_r
+                                    dr.override = new_r
+                                st.markdown("---")
+
+                            overall = compute_overall(br)
+                            ov_icon2 = RATING_ICONS.get(overall, "⚪")
+                            st.markdown(f"### {ov_icon2} 総合評価: **{overall}**")
+                            br.overall = overall
+
+                            if is_conf:
+                                st.success("✅ 確認完了")
+                                if st.button("✏️ 再編集", key=f"reedit_b_{pmid}"):
+                                    st.session_state.bias_confirmed[pmid] = False
+                                    st.rerun()
+                            else:
+                                if st.button("✅ この論文の評価を確定", key=f"confirm_b_{pmid}", type="primary"):
+                                    st.session_state.bias_confirmed[pmid] = True
+                                    br.confirmed = True
+                                    _autosave()
+                                    st.rerun()
+
+        # 次のステップへ
+        if confirmed > 0:
+            st.divider()
+            if st.button("▶ データ抽出へ →", type="primary"):
+                st.session_state.step = 4
+                st.rerun()
+
+
+# ════════════════════════════════════════════════════
+# TAB 4 : データ抽出  （JBI SUMARI Extraction スタイル）
+# ════════════════════════════════════════════════════
+with tabs[3]:
     from data_extraction import extract_from_pdf
 
-    st.header("③ データ抽出")
+    # ヘッダー行 + Export ボタン
+    _hc1, _hc2 = st.columns([5, 1])
+    _hc1.header("④ データ抽出")
+    # Export CSV
+    _export_ready = bool(st.session_state.extraction_results)
 
     df = st.session_state.articles_df
     if df is None or df.empty:
-        st.info("文献がありません。")
-        st.stop()
+        st.info("文献がありません。まずスクリーニングを完了してください。")
+    else:
+        if "FTステータス" in df.columns:
+            pdf_df_ex = df[(df["一次スクリーニング"] == "採択") & (df["FTステータス"] == "PDF済み")]
+        else:
+            pdf_df_ex = df[df["一次スクリーニング"] == "採択"]
 
-    pdf_df = df[(df["一次スクリーニング"] == "採択") & (df.get("FTステータス", "") == "PDF済み")] \
-        if "FTステータス" in df.columns else df[df["一次スクリーニング"] == "採択"]
+        total_pdfs = len(pdf_df_ex)
+        extracted_count = len(st.session_state.extraction_results)
+        confirmed_ex = sum(
+            1 for pmid, outs in st.session_state.extraction_results.items()
+            if outs and any(o.get("confirmed") for o in outs)
+        )
 
-    total_pdfs = len(pdf_df)
-    extracted_count = len(st.session_state.extraction_results)
+        # 統計メトリクス
+        em1, em2, em3 = st.columns(3)
+        em1.metric("対象論文", total_pdfs)
+        em2.metric("AI抽出済み", extracted_count)
+        em3.metric("確認完了", confirmed_ex)
 
-    mc1, mc2 = st.columns(2)
-    mc1.metric("PDF対象", total_pdfs)
-    mc2.metric("抽出済み", extracted_count)
+        # フィルタ
+        ex_filter = st.text_input("", placeholder="Filter extractions...", label_visibility="collapsed")
 
-    if total_pdfs == 0:
-        st.info("PDFがアップロードされた採択文献がありません。二次スクリーニングでPDFをアップロードしてください。")
-        st.stop()
+        if total_pdfs == 0:
+            st.info("PDFがアップロードされた採択文献がありません。スクリーニングタブでPDFを取得してください。")
+        else:
+            # 🤖 AI一括抽出ボタン
+            if st.button("🤖 AI一括自動抽出（全論文）", type="primary"):
+                prog_ex = st.progress(0)
+                stat_ex = st.empty()
+                for i, (idx, row) in enumerate(pdf_df_ex.iterrows()):
+                    pmid = str(row["PMID"])
+                    pdf_path = row.get("PDFパス", "")
+                    if pmid in st.session_state.extraction_results:
+                        prog_ex.progress((i+1)/total_pdfs)
+                        continue
+                    if pdf_path and os.path.exists(pdf_path):
+                        stat_ex.text(f"抽出中 ({i+1}/{total_pdfs}): {row['タイトル'][:50]}...")
+                        try:
+                            data = extract_from_pdf(pdf_path, pmid=pmid, title=row["タイトル"])
+                            st.session_state.extraction_results[pmid] = data.outcomes
+                        except Exception as e:
+                            st.session_state.extraction_results[pmid] = []
+                            st.warning(f"PMID {pmid}: エラー ({e})")
+                    else:
+                        st.warning(f"PMID {pmid}: PDFが見つかりません（スクリーニングでPDF取得してください）")
+                    prog_ex.progress((i+1)/total_pdfs)
+                stat_ex.text("✅ AI抽出完了")
+                _autosave()
+                st.rerun()
 
-    if st.button("🤖 全PDFから自動抽出", type="primary"):
-        prog = st.progress(0)
-        status = st.empty()
-        for i, (idx, row) in enumerate(pdf_df.iterrows()):
-            pmid = str(row["PMID"])
-            pdf_path = row.get("PDFパス", "")
-            if pmid in st.session_state.extraction_results:
-                prog.progress((i+1)/total_pdfs)
-                continue
-            if pdf_path and os.path.exists(pdf_path):
-                status.text(f"抽出中: {row['タイトル'][:50]}...")
-                try:
-                    data = extract_from_pdf(pdf_path, pmid=pmid, title=row["タイトル"])
-                    st.session_state.extraction_results[pmid] = data.outcomes
-                except Exception as e:
-                    st.session_state.extraction_results[pmid] = []
-                    st.warning(f"PMID {pmid}: エラー ({e})")
-            prog.progress((i+1)/total_pdfs)
-        status.text("✅ 自動抽出完了")
-        st.rerun()
+            st.markdown("---")
 
-    st.divider()
-    all_rows = []
-    for idx, row in pdf_df.iterrows():
-        pmid = str(row["PMID"])
-        outcomes = st.session_state.extraction_results.get(pmid)
-        with st.expander(f"📄 [{row['年']}] {row['タイトル'][:70]}"):
-            if outcomes is None:
-                st.warning("未抽出")
-                continue
-            with st.form(key=f"add_{pmid}"):
-                fc1, fc2, fc3, fc4, fc5 = st.columns([3,1,1,1,1])
-                nf = fc1.text_input("危険因子", key=f"nf_{pmid}", placeholder="previous hamstring injury")
-                nm = fc2.selectbox("種類", ["RR","OR","HR","IRR","SMD"], key=f"nm_{pmid}")
-                nv = fc3.number_input("効果量", min_value=0.0, value=1.0, step=0.01, key=f"nv_{pmid}")
-                nl = fc4.number_input("CI下限", min_value=0.0, value=0.0, step=0.01, key=f"ncil_{pmid}")
-                nu = fc5.number_input("CI上限", min_value=0.0, value=0.0, step=0.01, key=f"nciu_{pmid}")
-                if st.form_submit_button("＋ 追加"):
-                    st.session_state.extraction_results.setdefault(pmid, []).append({
-                        "risk_factor": nf, "measure_type": nm, "value": nv,
-                        "ci_lower": nl if nl>0 else None,
-                        "ci_upper": nu if nu>0 else None,
-                        "has_ci": nl>0 and nu>0, "context": "手動入力", "confirmed": True,
-                    })
+            # ── 論文リスト（JBI SUMARI Extraction スタイル） ──
+            all_rows = []
+            for idx, row in pdf_df_ex.iterrows():
+                pmid = str(row["PMID"])
+                title = row["タイトル"]
+
+                # フィルタ適用
+                if ex_filter and ex_filter.lower() not in title.lower():
+                    continue
+
+                outcomes = st.session_state.extraction_results.get(pmid)
+
+                # ステータス判定
+                if outcomes is None:
+                    status_lbl = "Start"
+                    status_color = "#2563EB"  # blue
+                elif outcomes and any(o.get("confirmed") for o in outcomes):
+                    status_lbl = "Completed"
+                    status_color = "#16A34A"  # green
+                else:
+                    status_lbl = "In Progress"
+                    status_color = "#2563EB"
+
+                # カード形式
+                with st.container(border=True):
+                    row_c1, row_c2 = st.columns([5, 1])
+                    with row_c1:
+                        st.markdown(f"**{title}**")
+                        st.caption(f"{row.get('年','')}　　{str(row.get('著者',''))[:60]}")
+                    with row_c2:
+                        btn_key = f"ex_open_{pmid}"
+                        if st.button(status_lbl, key=btn_key, type="secondary"):
+                            st.session_state[f"ex_open_{pmid}"] = not st.session_state.get(f"ex_open_{pmid}", False)
+
+                # 詳細パネル（展開時）
+                if st.session_state.get(f"ex_open_{pmid}", False):
+                    with st.container(border=True):
+                        st.markdown(f"**{title}**")
+                        st.caption(f"{row.get('年','')} — {str(row.get('著者',''))[:80]}")
+
+                        # ── Groups（サンプル記述）
+                        st.markdown("**Groups**")
+                        grp_key = f"grp_{pmid}"
+                        grp_val = st.session_state.get(grp_key, row.get("抄録","")[:200] if outcomes is None else "")
+                        with st.container(border=True):
+                            st.markdown("Group description and sample")
+                            new_grp = st.text_area("", value=grp_val, key=f"grp_ta_{pmid}",
+                                                   label_visibility="collapsed", height=80)
+                            st.session_state[grp_key] = new_grp
+
+                        # ── AI抽出結果 / 手動追加
+                        st.markdown("**抽出データ（危険因子・効果量・CI）**")
+
+                        if outcomes is None:
+                            st.warning("未抽出 — 上の「AI一括自動抽出」で処理されます")
+                        else:
+                            # 手動追加フォーム
+                            with st.form(key=f"add_ex_{pmid}"):
+                                fc1, fc2, fc3, fc4, fc5 = st.columns([3,1,1,1,1])
+                                nf = fc1.text_input("危険因子", key=f"nf_ex_{pmid}",
+                                                    placeholder="previous injury")
+                                nm = fc2.selectbox("種類", ["RR","OR","HR","IRR","SMD"], key=f"nm_ex_{pmid}")
+                                nv = fc3.number_input("効果量", min_value=0.0, value=1.0,
+                                                      step=0.01, key=f"nv_ex_{pmid}")
+                                nl = fc4.number_input("CI下限", min_value=0.0, value=0.0,
+                                                      step=0.01, key=f"nl_ex_{pmid}")
+                                nu = fc5.number_input("CI上限", min_value=0.0, value=0.0,
+                                                      step=0.01, key=f"nu_ex_{pmid}")
+                                if st.form_submit_button("＋ Add"):
+                                    st.session_state.extraction_results.setdefault(pmid, []).append({
+                                        "risk_factor": nf, "measure_type": nm, "value": nv,
+                                        "ci_lower": nl if nl>0 else None,
+                                        "ci_upper": nu if nu>0 else None,
+                                        "has_ci": nl>0 and nu>0,
+                                        "context": "手動入力", "confirmed": True,
+                                    })
+                                    _autosave()
+                                    st.rerun()
+
+                            for oi, outcome in enumerate(outcomes):
+                                ci_str = (f"{outcome['ci_lower']}–{outcome['ci_upper']}"
+                                          if outcome.get("has_ci") else "CI不明")
+                                ec1, ec2, ec3, ec4 = st.columns([3,2,2,1])
+                                new_f = ec1.text_input(
+                                    "危険因子", value=outcome.get("risk_factor",""),
+                                    key=f"efactor_{pmid}_{oi}", placeholder="危険因子名",
+                                    label_visibility="collapsed",
+                                )
+                                ec2.write(f"**{outcome['measure_type']}** = {outcome['value']}")
+                                ec3.write(f"95%CI: {ci_str}")
+                                if ec4.button("🗑️", key=f"edel_{pmid}_{oi}"):
+                                    st.session_state.extraction_results[pmid].pop(oi)
+                                    _autosave()
+                                    st.rerun()
+                                st.session_state.extraction_results[pmid][oi]["risk_factor"] = new_f
+                                all_rows.append({
+                                    "PMID": pmid, "タイトル": title[:50], "年": row["年"],
+                                    "危険因子": new_f, "効果量の種類": outcome["measure_type"],
+                                    "効果量": outcome["value"],
+                                    "CI下限": outcome.get("ci_lower",""),
+                                    "CI上限": outcome.get("ci_upper",""),
+                                })
+
+                        # ── Outcomes / Description of main results
+                        st.markdown("**Outcomes measured**")
+                        st.text_area("", key=f"outcomes_ta_{pmid}", label_visibility="collapsed", height=60)
+                        st.markdown("**Description of main results**")
+                        st.text_area("", key=f"results_ta_{pmid}", label_visibility="collapsed", height=80)
+
+                        # Save / Back ボタン
+                        sv1, sv2 = st.columns([1, 5])
+                        if sv1.button("💾 Save", key=f"save_ex_{pmid}", type="primary"):
+                            if outcomes:
+                                for o in st.session_state.extraction_results.get(pmid, []):
+                                    o["confirmed"] = True
+                            _autosave()
+                            st.session_state[f"ex_open_{pmid}"] = False
+                            st.rerun()
+                        if sv2.button("← Back", key=f"back_ex_{pmid}"):
+                            st.session_state[f"ex_open_{pmid}"] = False
+                            st.rerun()
+
+            # まとめてCSV出力
+            if all_rows:
+                result_df_ex = pd.DataFrame(all_rows)
+                st.session_state.extraction_df = result_df_ex
+                st.divider()
+                st.subheader("抽出データ一覧")
+                st.dataframe(result_df_ex, use_container_width=True)
+                _ec1, _ec2 = st.columns([1,1])
+                csv_ex = result_df_ex.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+                _ec1.download_button("📥 CSV ダウンロード", data=csv_ex,
+                                     file_name="extracted_data.csv", mime="text/csv")
+                if _ec2.button("▶ メタアナリシスへ →", type="primary"):
+                    st.session_state.step = 5
                     st.rerun()
-            for oi, outcome in enumerate(outcomes):
-                ci_str = f"{outcome['ci_lower']}–{outcome['ci_upper']}" if outcome.get("has_ci") else "CI不明"
-                c1, c2, c3, c4 = st.columns([3,2,2,1])
-                new_f = c1.text_input("危険因子", value=outcome.get("risk_factor",""),
-                                      key=f"factor_{pmid}_{oi}", placeholder="危険因子名")
-                c2.write(f"**{outcome['measure_type']}** = {outcome['value']}")
-                c3.write(f"95%CI: {ci_str}")
-                if c4.button("🗑️", key=f"del_{pmid}_{oi}"):
-                    st.session_state.extraction_results[pmid].pop(oi)
-                    st.rerun()
-                st.session_state.extraction_results[pmid][oi]["risk_factor"] = new_f
-                all_rows.append({
-                    "PMID": pmid, "タイトル": row["タイトル"][:50], "年": row["年"],
-                    "危険因子": new_f, "効果量の種類": outcome["measure_type"],
-                    "効果量": outcome["value"], "CI下限": outcome.get("ci_lower",""),
-                    "CI上限": outcome.get("ci_upper",""),
-                })
-
-    if all_rows:
-        result_df = pd.DataFrame(all_rows)
-        st.subheader("抽出データ一覧")
-        st.dataframe(result_df, use_container_width=True)
-        csv = result_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-        st.download_button("📥 CSVをダウンロード", data=csv, file_name="extracted_data.csv", mime="text/csv")
-        if st.button("▶ メタアナリシスへ", type="primary"):
-            st.session_state.extraction_df = result_df
-            st.session_state.step = 4
-            st.rerun()
 
 
 # ════════════════════════════════════════════════════
-# TAB 4 : メタアナリシス  （JBI SUMARI スタイル）
+# TAB 5 : メタアナリシス  （JBI SUMARI スタイル）
 # ════════════════════════════════════════════════════
-with tabs[3]:
+with tabs[4]:
     from meta_analysis import (
         StudyData, run_meta_analysis, interpret_heterogeneity,
         heterogeneity_recommendation, auto_select_method,
@@ -1261,132 +1539,6 @@ with tabs[3]:
                 st.success("✅ Robust to sensitivity analysis")
             else:
                 st.warning("⚠️ Statistical significance changed after excluding high-bias studies")
-
-
-# ════════════════════════════════════════════════════
-# TAB 5 : バイアス評価
-# ════════════════════════════════════════════════════
-with tabs[4]:
-    import pymupdf
-    from bias_assessment import (
-        auto_assess_bias, compute_overall,
-        QUIPS_DOMAINS, RATING_OPTIONS, RATING_ICONS,
-    )
-
-    st.header("⑤ バイアスリスク評価（QUIPS）")
-
-    df = st.session_state.articles_df
-    if df is None:
-        st.info("文献がありません。")
-        st.stop()
-
-    pdf_df = df[(df["一次スクリーニング"] == "採択") & (df.get("FTステータス","") == "PDF済み")] \
-        if "FTステータス" in df.columns else pd.DataFrame()
-
-    if pdf_df.empty:
-        st.info("PDFがアップロードされた採択文献がありません。")
-        st.stop()
-
-    total_p = len(pdf_df)
-    assessed = len(st.session_state.bias_results)
-    confirmed = sum(st.session_state.bias_confirmed.values())
-    mc1, mc2, mc3 = st.columns(3)
-    mc1.metric("対象論文", total_p)
-    mc2.metric("AI評価済み", assessed)
-    mc3.metric("確認完了", confirmed)
-
-    if st.button("🤖 全PDFをAI自動評価", type="primary"):
-        prog = st.progress(0)
-        for i, (idx, row) in enumerate(pdf_df.iterrows()):
-            pmid = str(row["PMID"])
-            pp = row.get("PDFパス","")
-            if pp and os.path.exists(pp):
-                try:
-                    doc = pymupdf.open(pp)
-                    text = "".join(p.get_text() for p in doc)
-                    doc.close()
-                    br = auto_assess_bias(text, pmid=pmid, title=row["タイトル"],
-                                         study_design=row.get("研究デザイン",""))
-                    st.session_state.bias_results[pmid] = br
-                    st.session_state.bias_ratings.setdefault(pmid, {})
-                except Exception as e:
-                    st.warning(f"PMID {pmid}: {e}")
-            prog.progress((i+1)/total_p)
-        st.rerun()
-
-    st.divider()
-
-    for idx, row in pdf_df.iterrows():
-        pmid = str(row["PMID"])
-        pp = row.get("PDFパス","")
-        br = st.session_state.bias_results.get(pmid)
-        is_conf = st.session_state.bias_confirmed.get(pmid, False)
-        conf_icon = "✅" if is_conf else "⏳"
-
-        with st.expander(f"{conf_icon} [{row['年']}] {row['タイトル'][:70]}"):
-            left, right = st.columns([1,1])
-
-            with left:
-                st.markdown("**📄 PDF ビューア**")
-                if pp and os.path.exists(pp):
-                    pk = f"page_{pmid}"
-                    st.session_state.setdefault(pk, 0)
-                    try:
-                        doc = pymupdf.open(pp)
-                        total_pg = doc.page_count
-                        cur_pg = st.session_state[pk]
-                        n1, n2, n3 = st.columns([1,2,1])
-                        if n1.button("◀", key=f"prev_{pmid}") and cur_pg > 0:
-                            st.session_state[pk] -= 1; st.rerun()
-                        n2.markdown(f"<div style='text-align:center'>{cur_pg+1}/{total_pg}</div>",
-                                    unsafe_allow_html=True)
-                        if n3.button("▶", key=f"next_{pmid}") and cur_pg < total_pg-1:
-                            st.session_state[pk] += 1; st.rerun()
-                        page = doc.load_page(cur_pg)
-                        pix = page.get_pixmap(matrix=pymupdf.Matrix(1.5,1.5))
-                        st.image(pix.tobytes("png"), use_container_width=True)
-                        doc.close()
-                    except Exception as e:
-                        st.error(f"PDF表示エラー: {e}")
-                else:
-                    st.info("PDFが見つかりません。")
-
-            with right:
-                st.markdown("**📋 QUIPS バイアス評価**")
-                if br is None:
-                    st.info("「🤖 全PDFをAI自動評価」を実行してください。")
-                else:
-                    ov_map = st.session_state.bias_ratings.get(pmid, {})
-                    for domain in QUIPS_DOMAINS:
-                        d_id = domain["id"]
-                        dr = next((d for d in br.domains if d.domain_id == d_id), None)
-                        if not dr: continue
-                        cur_r = ov_map.get(d_id, dr.rating)
-                        icon = RATING_ICONS.get(cur_r, "⚪")
-                        st.markdown(f"**{icon} {domain['label']}**")
-                        st.caption(f"AI: {dr.rating} — {dr.reason}")
-                        new_r = st.selectbox("評価", RATING_OPTIONS,
-                                             index=RATING_OPTIONS.index(cur_r),
-                                             key=f"rating_{pmid}_{d_id}",
-                                             label_visibility="collapsed")
-                        if new_r != dr.rating:
-                            st.session_state.bias_ratings.setdefault(pmid, {})[d_id] = new_r
-                            dr.override = new_r
-                        st.markdown("---")
-
-                    overall = compute_overall(br)
-                    ov_icon = RATING_ICONS.get(overall, "⚪")
-                    st.markdown(f"### {ov_icon} 総合評価: **{overall}**")
-                    br.overall = overall
-
-                    if is_conf:
-                        st.success("✅ 確認完了")
-                        if st.button("✏️ 再編集", key=f"reedit_{pmid}"):
-                            st.session_state.bias_confirmed[pmid] = False; st.rerun()
-                    else:
-                        if st.button("✅ 確認完了", key=f"confirm_{pmid}", type="primary"):
-                            st.session_state.bias_confirmed[pmid] = True
-                            br.confirmed = True; st.rerun()
 
 
 # ════════════════════════════════════════════════════
