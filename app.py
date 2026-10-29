@@ -1008,19 +1008,23 @@ with tabs[3]:
                     status_lbl = "In Progress"
                     status_color = "#2563EB"
 
-                # カード形式
+                # カード形式 — トグル用フラグをボタンとは別キーで管理
+                _open_key = f"_ex_panel_{pmid}"
+                st.session_state.setdefault(_open_key, False)
+
                 with st.container(border=True):
                     row_c1, row_c2 = st.columns([5, 1])
                     with row_c1:
                         st.markdown(f"**{title}**")
                         st.caption(f"{row.get('年','')}　　{str(row.get('著者',''))[:60]}")
                     with row_c2:
-                        btn_key = f"ex_open_{pmid}"
-                        if st.button(status_lbl, key=btn_key, type="secondary"):
-                            st.session_state[f"ex_open_{pmid}"] = not st.session_state.get(f"ex_open_{pmid}", False)
+                        def _toggle_ex(k=_open_key):
+                            st.session_state[k] = not st.session_state[k]
+                        st.button(status_lbl, key=f"ex_btn_{pmid}",
+                                  type="secondary", on_click=_toggle_ex)
 
                 # 詳細パネル（展開時）
-                if st.session_state.get(f"ex_open_{pmid}", False):
+                if st.session_state.get(_open_key, False):
                     with st.container(border=True):
                         st.markdown(f"**{title}**")
                         st.caption(f"{row.get('年','')} — {str(row.get('著者',''))[:80]}")
@@ -1095,17 +1099,18 @@ with tabs[3]:
                         st.text_area("", key=f"results_ta_{pmid}", label_visibility="collapsed", height=80)
 
                         # Save / Back ボタン
-                        sv1, sv2 = st.columns([1, 5])
-                        if sv1.button("💾 Save", key=f"save_ex_{pmid}", type="primary"):
-                            if outcomes:
-                                for o in st.session_state.extraction_results.get(pmid, []):
-                                    o["confirmed"] = True
+                        def _save_ex(p=pmid, k=_open_key):
+                            for o in st.session_state.extraction_results.get(p, []):
+                                o["confirmed"] = True
                             _autosave()
-                            st.session_state[f"ex_open_{pmid}"] = False
-                            st.rerun()
-                        if sv2.button("← Back", key=f"back_ex_{pmid}"):
-                            st.session_state[f"ex_open_{pmid}"] = False
-                            st.rerun()
+                            st.session_state[k] = False
+                        def _back_ex(k=_open_key):
+                            st.session_state[k] = False
+                        sv1, sv2 = st.columns([1, 5])
+                        sv1.button("💾 Save", key=f"save_ex_{pmid}",
+                                   type="primary", on_click=_save_ex)
+                        sv2.button("← Back", key=f"back_ex_{pmid}",
+                                   on_click=_back_ex)
 
             # まとめてCSV出力
             if all_rows:
